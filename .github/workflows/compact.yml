@@ -1,0 +1,44 @@
+name: compact-daily
+# GitHub limits (see docs/agent_runs/RUNBOOK_P3_PUBLISH.md):
+# * scheduled runs may start late or be skipped when GitHub is under load; the entry
+#   points are idempotent and catch up on the next run (skip if the object exists in R2);
+# * scheduled workflows in a public repository are disabled automatically after 60 days
+#   without repository activity (re-enable in the Actions tab or push a commit).
+# Secrets are referenced by name only and passed as environment variables to one step;
+# GitHub masks them in logs and the code redacts them as well. Never echo them.
+
+on:
+  schedule:
+    - cron: "15 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compact-daily
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-ci.txt
+      - name: Run
+        env:
+          PYTHONUNBUFFERED: "1"
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: python -m src.realtime.compact_daily

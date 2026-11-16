@@ -1,0 +1,32 @@
+name: tests
+# Offline tests only (no network, no secrets).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  pytest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-ci.txt
+      - name: Pytest (no network)
+        run: python -m pytest -q tests/test_realtime.py tests/test_temporal_contract.py

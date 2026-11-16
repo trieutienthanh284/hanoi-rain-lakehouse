@@ -1,0 +1,147 @@
+# Phase 3A — continuous ingestion (GitHub Actions). Read by src/realtime/*.
+# Credentials are NOT here: they come from environment variables only
+# (GitHub Secrets in CI; .env loaded at runtime locally).
+version: "1.0"
+
+remote:
+  bucket_env: "R2_BUCKET"
+  realtime_prefix: "lake/v1/realtime/"
+  status_prefix: "lake/v1/status/"
+  # The only object that may be overwritten (status snapshot). Everything else is put-if-absent.
+  overwritable_keys:
+    - "lake/v1/status/freshness.json"
+
+workdir:
+  # Local working copy. On GitHub runners $RUNNER_TEMP is used instead (ephemeral).
+  local_default: "data/_ci_test/work"
+
+sources:
+  gsmap_now:
+    data_time_field: "window_end_utc"
+    stale_after_minutes: 120
+    lookback_days: 2           # manifest partitions scanned by the freshness monitor
+  openmeteo:
+    # Age is measured from the time Open-Meteo made the run available (metadata), not from the
+    # initialisation time: ECMWF IFS runs appear ~7.3 h after init, so an issue-time age legitimately
+    # reaches ~13.3 h before the next run and a 12 h issue-time rule would raise false alarms (D27).
+    data_time_field: "model_availability_time_utc"
+    stale_after_minutes: 720
+    lookback_days: 2
+  imerg_late:
+    data_time_field: "window_end_utc"
+    stale_after_minutes: 2880
+    lookback_days: 5
+
+gsmap_now:
+  latest_directory: "/now/latest"   # same value as configs/gsmap_now.yaml access.latest_directory
+  max_files_per_run: 60             # rolling ~24 h listing holds 48 rain windows
+
+imerg_late:
+  lookback_days: 7          # candidate days: yesterday back to 7 days ago
+  max_days_per_run: 2       # newest complete missing days first
+  expected_granules: 48
+  label_status: "provisional"   # IMERG Late is superseded by IMERG Final later
+
+compaction:
+  lookback_days: 3
+  min_hours_after_day_end: 1    # last window (23:30-00:30) is ingested at ~00:37
+
+openmeteo:
+  api: "https://api.open-meteo.com/v1/forecast"
+  metadata_endpoint: "https://api.open-meteo.com/data/{meta_model}/static/meta.json"
+  variable: "precipitation"
+  forecast_days: 3
+  user_agent: "hanoi-flood-lakehouse-research/0.1 (non-commercial thesis prototype)"
+  license: "CC BY 4.0, Weather data by Open-Meteo.com"
+  models:
+    gfs_global:
+      # Open-Meteo "GFS Global" blends NCEP GFS 0.11/0.13 deg and 0.25 deg; the issue time is
+      # recorded as the newest initialisation of the components (upper bound).
+      meta_models: ["ncep_gfs013", "ncep_gfs025"]
+    ecmwf_ifs025:
+      meta_models: ["ecmwf_ifs025"]
+  # 81 points = 47 city pixels + 34 buffer pixels on the 0.5 deg sub-grid (D19),
+  # exported from data/reference/rain_pixels_hanoi_city.parquet so CI needs no data/ files.
+  # [pixel_id, lat, lon, role]
+  points:
+  - [3944845, 19.55, 104.55, buffer]
+  - [3944850, 19.55, 105.05, buffer]
+  - [3944855, 19.55, 105.55, buffer]
+  - [3944860, 19.55, 106.05, buffer]
+  - [3944865, 19.55, 106.55, buffer]
+  - [3944870, 19.55, 107.05, buffer]
+  - [3962845, 20.05, 104.55, buffer]
+  - [3962850, 20.05, 105.05, buffer]
+  - [3962855, 20.05, 105.55, buffer]
+  - [3962860, 20.05, 106.05, buffer]
+  - [3962865, 20.05, 106.55, buffer]
+  - [3962870, 20.05, 107.05, buffer]
+  - [3980845, 20.55, 104.55, buffer]
+  - [3980850, 20.55, 105.05, buffer]
+  - [3980855, 20.55, 105.55, buffer]
+  - [3980857, 20.55, 105.75, city]
+  - [3980858, 20.55, 105.85, city]
+  - [3980860, 20.55, 106.05, buffer]
+  - [3980865, 20.55, 106.55, buffer]
+  - [3980870, 20.55, 107.05, buffer]
+  - [3984457, 20.65, 105.75, city]
+  - [3984458, 20.65, 105.85, city]
+  - [3984459, 20.65, 105.95, city]
+  - [3984460, 20.65, 106.05, city]
+  - [3988056, 20.75, 105.65, city]
+  - [3988057, 20.75, 105.75, city]
+  - [3988058, 20.75, 105.85, city]
+  - [3988059, 20.75, 105.95, city]
+  - [3988060, 20.75, 106.05, city]
+  - [3991656, 20.85, 105.65, city]
+  - [3991657, 20.85, 105.75, city]
+  - [3991658, 20.85, 105.85, city]
+  - [3991659, 20.85, 105.95, city]
+  - [3995255, 20.95, 105.55, city]
+  - [3995256, 20.95, 105.65, city]
+  - [3995257, 20.95, 105.75, city]
+  - [3995258, 20.95, 105.85, city]
+  - [3995259, 20.95, 105.95, city]
+  - [3995260, 20.95, 106.05, city]
+  - [3998845, 21.05, 104.55, buffer]
+  - [3998850, 21.05, 105.05, buffer]
+  - [3998853, 21.05, 105.35, city]
+  - [3998854, 21.05, 105.45, city]
+  - [3998855, 21.05, 105.55, city]
+  - [3998856, 21.05, 105.65, city]
+  - [3998857, 21.05, 105.75, city]
+  - [3998858, 21.05, 105.85, city]
+  - [3998859, 21.05, 105.95, city]
+  - [3998860, 21.05, 106.05, city]
+  - [3998865, 21.05, 106.55, buffer]
+  - [3998870, 21.05, 107.05, buffer]
+  - [4002453, 21.15, 105.35, city]
+  - [4002454, 21.15, 105.45, city]
+  - [4002455, 21.15, 105.55, city]
+  - [4002456, 21.15, 105.65, city]
+  - [4002457, 21.15, 105.75, city]
+  - [4002458, 21.15, 105.85, city]
+  - [4002459, 21.15, 105.95, city]
+  - [4002460, 21.15, 106.05, city]
+  - [4006053, 21.25, 105.35, city]
+  - [4006054, 21.25, 105.45, city]
+  - [4006055, 21.25, 105.55, city]
+  - [4006057, 21.25, 105.75, city]
+  - [4006058, 21.25, 105.85, city]
+  - [4006059, 21.25, 105.95, city]
+  - [4006060, 21.25, 106.05, city]
+  - [4009658, 21.35, 105.85, city]
+  - [4009659, 21.35, 105.95, city]
+  - [4013258, 21.45, 105.85, city]
+  - [4016845, 21.55, 104.55, buffer]
+  - [4016850, 21.55, 105.05, buffer]
+  - [4016855, 21.55, 105.55, buffer]
+  - [4016860, 21.55, 106.05, buffer]
+  - [4016865, 21.55, 106.55, buffer]
+  - [4016870, 21.55, 107.05, buffer]
+  - [4034845, 22.05, 104.55, buffer]
+  - [4034850, 22.05, 105.05, buffer]
+  - [4034855, 22.05, 105.55, buffer]
+  - [4034860, 22.05, 106.05, buffer]
+  - [4034865, 22.05, 106.55, buffer]
+  - [4034870, 22.05, 107.05, buffer]

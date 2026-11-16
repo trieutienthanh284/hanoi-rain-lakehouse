@@ -1,0 +1,25 @@
+# Phase 3A — only what src/realtime/* and the offline tests need (GitHub-hosted runners, Python 3.14).
+# Versions pinned to the local .venv that was used for the end-to-end test (docs/agent_runs/env.txt).
+boto3==1.43.119
+botocore==1.43.121
+s3transfer==0.19.3
+jmespath==1.1.0
+python-dateutil==2.9.0.post0
+six==1.17.0
+urllib3==2.8.0
+h5py==3.16.0
+numpy==2.5.3
+pandas==3.0.6
+tzdata==2026.5
+pyarrow==26.0.1
+requests==2.34.2
+certifi==2026.7.22
+charset-normalizer==3.5.2
+idna==3.20
+python-dotenv==1.2.4
+PyYAML==6.0.3
+pytest==9.2.0
+pluggy==1.7.0
+iniconfig==2.3.1
+packaging==26.3
+Pygments==2.21.0

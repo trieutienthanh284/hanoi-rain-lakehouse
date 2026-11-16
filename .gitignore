@@ -1,0 +1,22 @@
+﻿# secrets
+.env
+.env.*
+!.env.example
+# environments / tools
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+.vscode/
+.claude/
+# data and generated outputs (system of record = Cloudflare R2)
+data/
+logs/
+*.log
+_archive/
+audit_runs/
+reports/**/*.parquet
+reports/**/*.h5
+reports/**/*.png

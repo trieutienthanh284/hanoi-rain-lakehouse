@@ -1,0 +1,83 @@
+version: "1.0"
+created: "2026-11-15"
+description: "Whole-Hanoi meteorological dataset (Phase 1). See ADD-001 and ADD-002."
+
+domain:
+  name: "hanoi_city"
+  provisional: false
+  boundary_file: "data/reference/hanoi_city_boundary.geojson"
+  boundary_provenance: "data/reference/hanoi_city_boundary.provenance.json"
+  boundary_source: "geoBoundaries gbOpen VNM ADM1 (VNM-ADM1-63759600), Public Domain"
+  area_km2: 3214.693
+  city_bounds:          # bbox of the city polygon, degrees
+    lat_min: 20.546104
+    lat_max: 21.404762
+    lon_min: 105.358410
+    lon_max: 106.073431
+  buffer_deg: 1.0
+  domain_bounds:        # city bbox + buffer
+    lat_min: 19.546104
+    lat_max: 22.404762
+    lon_min: 104.358410
+    lon_max: 107.073431
+  grid:                 # global 0.1 deg grid, see src/lake/grid.py
+    resolution_deg: 0.1
+    lat_idx_min: 1095   # centre 19.55
+    lat_idx_max: 1124   # centre 22.45
+    lon_idx_min: 2843   # centre 104.35
+    lon_idx_max: 2870   # centre 107.05
+    n_lat: 30
+    n_lon: 28
+    n_pixels: 840
+    n_city_pixels: 47
+    n_core9_pixels: 5
+  h3:
+    resolution: 9
+    n_city_cells: 27918
+    n_core9_cells: 1481
+  comparison_subsets:
+    core9: "data/reference/hanoi_core_h3_res9.geojson"
+
+paths:
+  reference_dir: "data/reference"
+  city_h3: "data/reference/hanoi_city_h3_res9.parquet"
+  rain_pixels: "data/reference/rain_pixels_hanoi_city.parquet"
+  pixel_h3_map: "data/reference/pixel_h3_map_hanoi_city.parquet"
+  bronze_regional_root: "data/bronze_regional"
+  silver_met_root: "data/silver/met"
+  scratch_dir: "data/_scratch"
+  readiness_reports: "reports/p1_readiness"
+
+products:
+  imerg_final:
+    name: "GPM IMERG Final Run Half-Hourly V07"
+    cmr_short_name: "GPM_3IMERGHH"
+    version: "07"
+    bronze_global_root: "data/bronze/imerg/raw"
+    filename_regex: "^3B-HHR\\.MS\\.MRG\\.3IMERG\\.(?P<date>\\d{8})-S(?P<start>\\d{6})-E(?P<end>\\d{6})\\.(?P<minutes>\\d{4})\\.V07(?P<sub>[A-Z])\\.HDF5$"
+    windows_per_day: 48
+    variables: ["precipitation", "precipitationQualityIndex", "probabilityLiquidPrecipitation", "randomError", "MWprecipitation", "IRprecipitation"]
+    role: "reference_label"
+  imerg_late:
+    name: "GPM IMERG Late Run Half-Hourly V07"
+    cmr_short_name: "GPM_3IMERGHHL"
+    version: "07"
+    role: "provisional_label"
+  imerg_early:
+    name: "GPM IMERG Early Run Half-Hourly V07"
+    cmr_short_name: "GPM_3IMERGHHE"
+    version: "07"
+    role: "near_realtime_candidate"
+  gsmap_now:
+    name: "GSMaP NOW Hourly Rain Rate"
+    config: "configs/gsmap_now.yaml"
+    bronze_global_root: "data/bronze/rainfall/gsmap_now/raw"
+    variables: ["hourlyPrecipRate", "hourlyPrecipRateGC"]
+    windows_per_day: 48     # half-hourly updates of a 1-hour window
+    fallback_latency_minutes: 30
+    latency_median_limit_hours: 3
+
+remote:
+  storage: "cloudflare_r2"
+  prefix: "lake/v1/"
+  env_vars: ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"]
