@@ -10,3 +10,5 @@ No flood probability or FLOOD / NO FLOOD prediction is claimed.
 
 Data sources: GSMaP NOW © JAXA EORC; IMERG © NASA GES DISC;
 Weather data by Open-Meteo.com (CC BY 4.0).
+
+Status: continuous ingestion started on 2026-11-16.
