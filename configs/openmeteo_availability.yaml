@@ -1,0 +1,23 @@
+# P2B.6 rule (agent-written; see DECISIONS.md)
+version: 1
+written_utc: '2026-11-17T04:32:41.887839+00:00'
+source: 9 realtime manifests on R2 (lake/v1/realtime/openmeteo/manifest/), read-only
+run_span_days: 1.0
+first_issue_utc: '2026-11-15T18:00:00+00:00'
+last_issue_utc: '2026-11-16T18:00:00+00:00'
+status: NEEDS_REVIEW (run span 1.0 d < 14 d)
+applies_to: 'historical Open-Meteo previous_day1 Silver: available_time = forecast_issue_time
+  + delay'
+models:
+  gfs_global:
+    delay_min: 420
+    basis: max(documented delay, max p90 over model and its components + 30 min),
+      rounded up to 10 min
+    n_observations: 4
+    observed_p90_min: 386.6
+  ecmwf_ifs025:
+    delay_min: 530
+    basis: max(documented delay, max p90 over model and its components + 30 min),
+      rounded up to 10 min
+    n_observations: 5
+    observed_p90_min: 494.1

@@ -190,3 +190,52 @@ STAGED_SAME
 11 tệp staged giữ nguyên (đúng như `staged_before.txt`). Mọi tệp mới của phase này ở trạng thái untracked (`??`), không có thao tác `git add/commit/push/reset/restore/checkout/stash/rebase/clean/rm`. Không xóa tệp nào; không ghi vào `data/bronze`.
 
 Bằng chứng không ghi vào thư mục backfill: không tồn tại `data/bronze_regional/imerg_late/date=2026-11-13|14`, `data/bronze_regional/gsmap_now/date=2026-11-16`, `data/silver/met/gsmap_now/date=2026-11-16`, `data/_scratch/gsmap_now/date=2026-11-16`; manifest backfill không có dòng nào cho 2026-11-13..16. Toàn bộ workdir realtime nằm trong `data/_ci_test/work` (18 MB tổng `data/_ci_test`).
+
+
+## P3B hotfix (2026-11-17) — Open-Meteo không còn thất bại vì metadata chậm
+
+**Kết quả: PASS** (một điểm cần xem lại ở mục Rủi ro).
+
+**Nguyên nhân.** Lần chạy #15 và #16 của `openmeteo-latest` (07:20, 08:20 giờ Hà Nội): yêu cầu metadata `ncep_gfs013/static/meta.json` hết thời gian đọc 120 s, chờ 60 s, retry lại hết 120 s → ngoại lệ lan khỏi `model_runs()` và cả job thoát mã 3 sau ≈ 5 phút, dù ECMWF và endpoint forecast không liên quan. Metadata được đọc tuần tự cho mọi model trong một hàm duy nhất, không có cô lập theo model.
+
+**Thay đổi** (`src/realtime/openmeteo_latest.py`):
+1. Timeout metadata (kết nối 10 s, đọc 30 s), một retry sau 15 s → tối đa 75 s/yêu cầu. Timeout forecast 120 s → (10 s, 60 s); retry forecast giữ 60 s. HTTP 429 ở bất kỳ yêu cầu nào: không retry, exit 4.
+2. Xử lý độc lập từng model; trạng thái theo model `published | skipped_existing | skipped_changed | failed` kèm `availability_source` trong dòng `summary` (thêm `exit_code`).
+3. Metadata hỏng sau retry → run xác định bằng quy tắc lịch sử P2B.6 (`configs/openmeteo_availability.yaml`): run 6 giờ mới nhất có `issue + delay ≤ now`, `model_availability_time_utc = issue + delay`; manifest và parquet ghi `availability_source = "rule_fallback"` (bình thường: `"metadata"`), kèm `rule_delay_min`, `metadata_error`. `available_time_utc` vẫn là thời điểm truy xuất thật. Issue theo quy tắc là cận dưới của run thực tế (D55).
+4. Exit 0 khi ít nhất một model được công bố hoặc bỏ qua; 3 chỉ khi mọi model thất bại; 4 cho 429.
+5. `freshness_monitor` coi manifest `rule_fallback` là dữ liệu hợp lệ (đọc `model_availability_time_utc` như cũ) và ghi thêm `availability_source` theo stream.
+
+**Kiểm thử** (không mạng, `tests/test_realtime.py`, +7 test):
+
+| Test | Kết quả |
+|---|---|
+| Timeout metadata chỉ `ncep_gfs013` → ECMWF `metadata`, GFS `rule_fallback`, exit 0 | PASS |
+| Timeout metadata cả hai model, forecast được → cả hai `rule_fallback`, exit 0; freshness không STALE; lần chạy sau không tạo bản sao | PASS |
+| Forecast hỏng cho cả hai → exit 3 | PASS |
+| 429 ở metadata hoặc forecast → exit 4, không retry (2 test) | PASS |
+| Tổng thời gian chờ mô phỏng cho một yêu cầu metadata hỏng = 30 + 15 + 30 = 75 s ≤ 80 s | PASS |
+| Quy tắc fallback bảo thủ (`rule_run`) | PASS |
+| Các test không lộ bí mật cũ | PASS |
+
+```
+$ .venv/Scripts/python.exe -m pytest -q -p no:cacheprovider tests
+83 passed in 65.80s
+$ (trong D:\hanoi-rain-lakehouse-public) python -m pytest -q -p no:cacheprovider tests/test_realtime.py tests/test_temporal_contract.py
+49 passed in 29.32s
+$ .venv/Scripts/python.exe -m src.realtime.openmeteo_latest --store local:data/_ci_test/p3b_hotfix   # mạng thật, không R2
+exit=0; gfs_global_run20261117T0000 và ecmwf_ifs025_run20261117T0000 published, availability_source=metadata, 5,6 s
+```
+
+**Rủi ro / cần xem lại.** Lần chạy thử thật cho thấy ECMWF run 00Z ngày 2026-11-17 có mặt lúc 09:03:52Z = **543 phút** sau init, lớn hơn quy tắc 530 phút (P2B.6 vẫn NEEDS_REVIEW, mới có 1 ngày dữ liệu). Nếu metadata ECMWF hỏng đúng trong khoảng 530–543 phút sau một lần init, fallback sẽ gán nhãn run mới trong khi Open-Meteo còn phục vụ run cũ (issue bị ghi muộn hơn thực tế 6 h). `available_time_utc` (thời điểm truy xuất) vẫn đúng nên không có rò rỉ thời gian ở cột này. Khuyến nghị: chạy lại `src.quality.openmeteo_availability --write-rule` từ ~2026-11-30 như đã định; tôi không sửa tệp quy tắc trong hotfix này.
+
+**Tệp đã đổi (repo phát triển).** `src/realtime/openmeteo_latest.py`, `src/realtime/freshness_monitor.py`, `tests/test_realtime.py`, `docs/agent_runs/publish_paths_p3.txt` (+ `configs/openmeteo_availability.yaml`), mới: `docs/agent_runs/publish_paths_p3b_hotfix.txt`; sổ sách: `DECISIONS.md` (D55–D57), `STATUS.md`, báo cáo này. Không đổi workflow, không đổi `configs/realtime.yaml`.
+
+**Không đồng bộ (D56).** `configs/targets.yaml` trong repo phát triển đã bị sửa ngoài task này (`threshold_mm_h: null` → `2.5`, 2026-11-17 18:25) và `src/lake/r2_sync.py` (D54) khác snapshot công khai; cả hai cố ý không sao chép. Người dùng quyết định riêng.
+
+**Lệnh cho người dùng** (PowerShell; tôi không chạy git):
+```
+git -C "D:\hanoi-rain-lakehouse-public" add -- configs/openmeteo_availability.yaml src/realtime/openmeteo_latest.py src/realtime/freshness_monitor.py tests/test_realtime.py docs/agent_runs/REPORT_P3A.md
+git -C "D:\hanoi-rain-lakehouse-public" commit -m "fix(openmeteo): per-model isolation, short metadata timeouts, rule fallback"
+git -C "D:\hanoi-rain-lakehouse-public" push
+```
+Sau khi push: chạy tay `openmeteo-latest` (workflow_dispatch) một lần, xem dòng `summary` có `exit_code: 0` và `models.*.availability_source`.

@@ -15,6 +15,7 @@ import h5py
 import numpy as np
 import pandas as pd
 import pytest
+import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -285,7 +286,7 @@ class FakeOM:
     def __init__(self, init_unix: dict[str, list[int]], fail_with: str | None = None):
         self.init, self.calls, self.forecasts, self.fail_with = init_unix, {}, 0, fail_with
 
-    def __call__(self, url, params, ua):
+    def __call__(self, url, params, ua, timeout=None):
         if self.fail_with:
             raise RuntimeError(self.fail_with)
         m = re.search(r"/data/([a-z0-9_]+)/static/meta.json", url)
@@ -346,6 +347,156 @@ def test_openmeteo_skips_run_that_changes_during_request(cfg, env):
     fake = FakeOM({"ncep_gfs013": [init, init + 21600], "ncep_gfs025": [init], "ecmwf_ifs025": [init]})
     r = om.run(store, cfg, getter=fake)
     assert r["skipped_changed"] == ["gfs_global"] and [p["id"] for p in r["published"]] == ["ecmwf_ifs025_run20261116T0000"]
+
+
+# ---------------------------------------------------------------- Open-Meteo P3B hotfix (slow metadata)
+class FaultyOM(FakeOM):
+    """FakeOM with injectable failures and a simulated clock (no real waiting).
+    meta_timeout: meta models whose metadata request times out; forecast_fail: forecast raises;
+    rate_limit: 'meta' or 'forecast' -> HTTP 429. Forecast hours span [now - 24 h, now + 72 h]."""
+
+    def __init__(self, init_unix, meta_timeout=(), forecast_fail=False, rate_limit=None, now=None):
+        super().__init__(init_unix)
+        self.meta_timeout, self.forecast_fail, self.rate_limit = set(meta_timeout), forecast_fail, rate_limit
+        self.clock_s, self.timeouts, self.urls = 0.0, [], []
+        self.base = int((now or datetime.now(timezone.utc)).timestamp()) // 3600 * 3600 - 24 * 3600
+
+    def __call__(self, url, params, ua, timeout=None):
+        self.urls.append(url)
+        self.timeouts.append(timeout)
+        m = re.search(r"/data/([a-z0-9_]+)/static/meta.json", url)
+        if self.rate_limit == ("meta" if m else "forecast"):
+            raise om.RateLimited("HTTP 429: Too many requests")
+        if m and m[1] in self.meta_timeout:
+            self.clock_s += timeout[1]                       # the read timeout elapses
+            raise requests.exceptions.ReadTimeout(f"Read timed out. (read timeout={timeout[1]})")
+        if not m and self.forecast_fail:
+            self.clock_s += timeout[1]
+            raise requests.exceptions.ConnectionError("forecast endpoint unreachable")
+        if m:
+            return super().__call__(url, params, ua, timeout)
+        self.forecasts += 1
+        models = params["models"].split(",")
+        times = [self.base + 3600 * k for k in range(1, 97)]
+        out = []
+        for _ in range(len(params["latitude"].split(","))):
+            h = {"time": times}
+            for mo in models:
+                h[f"precipitation_{mo}" if len(models) > 1 else "precipitation"] = [0.2] * len(times)
+            out.append({"latitude": 21.0, "longitude": 105.8, "hourly": h})
+        return _Resp(out)
+
+
+@pytest.fixture()
+def waits(monkeypatch):
+    rec = []
+    monkeypatch.setattr(om, "_sleep", rec.append)
+    return rec
+
+
+def _om_manifests(store):
+    return {C.id_from_manifest_key(k).rsplit("_run", 1)[0]: store.get_json(k)
+            for k in store.list("lake/v1/realtime/openmeteo/manifest/") if k.endswith(".json")}
+
+
+def _recent_init():
+    t = datetime.now(timezone.utc) - timedelta(hours=8)
+    return int(t.replace(hour=t.hour - t.hour % 6, minute=0, second=0, microsecond=0).timestamp())
+
+
+def test_rule_run_is_conservative():
+    now = datetime(2026, 11, 17, 1, 20, tzinfo=timezone.utc)          # 08:20 Hanoi, run #16
+    for delay in (360, 420, 530):
+        r = om.rule_run(now, delay)
+        assert r["issue"].hour % 6 == 0 and r["issue"].minute == 0
+        assert r["availability"] == r["issue"] + timedelta(minutes=delay) <= now
+        assert r["availability"] + timedelta(hours=6) > now                # newest run satisfying the rule
+    assert om.rule_run(now, 420)["issue"] == datetime(2026, 11, 16, 18, tzinfo=timezone.utc)
+    assert om.rule_run(now, 530)["issue"] == datetime(2026, 11, 16, 12, tzinfo=timezone.utc)
+    assert set(om.load_rule_delays()) == {"gfs_global", "ecmwf_ifs025"}
+
+
+def test_openmeteo_gfs013_metadata_timeout_falls_back(cfg, env, waits, capsys):
+    init = _recent_init()
+    fake = FaultyOM({"ncep_gfs025": [init], "ecmwf_ifs025": [init]}, meta_timeout={"ncep_gfs013"})
+    code = om.main(["--store", f"local:{env / 'r2'}"], getter=fake)
+    assert code == 0 and fake.forecasts == 1
+    man = _om_manifests(C.LocalStore(cfg, env / "r2"))
+    assert set(man) == {"gfs_global", "ecmwf_ifs025"}
+    assert man["ecmwf_ifs025"]["availability_source"] == "metadata"
+    assert man["ecmwf_ifs025"]["metadata_after_check"] == "same_run"
+    g = man["gfs_global"]
+    delay = om.load_rule_delays()["gfs_global"]
+    issue, avail, ing = (C.parse_iso(g[k]) for k in ("forecast_issue_time_utc", "model_availability_time_utc",
+                                                       "ingestion_time_utc"))
+    assert g["availability_source"] == "rule_fallback" and g["rule_delay_min"] == delay
+    assert avail == issue + timedelta(minutes=delay) <= ing                # never earlier than the rule
+    assert "ReadTimeout" in g["metadata_error"] and g["rows"] > 0 and g["points"] == 81
+    summary = [json.loads(l) for l in capsys.readouterr().out.splitlines() if '"summary"' in l][-1]
+    assert summary["exit_code"] == 0
+    assert summary["models"]["gfs_global"] == {"status": "published", "availability_source": "rule_fallback",
+                                               "id": g["id"]}
+    assert summary["models"]["ecmwf_ifs025"]["availability_source"] == "metadata"
+    # ncep_gfs025 is not requested once ncep_gfs013 failed (bounded job time); waits: one 15 s retry wait
+    assert waits == [om.META_RETRY_WAIT_S] and not any("ncep_gfs025" in u for u in fake.urls)
+
+
+def test_openmeteo_all_metadata_timeout_both_fallback(cfg, env, waits):
+    fake = FaultyOM({}, meta_timeout={"ncep_gfs013", "ncep_gfs025", "ecmwf_ifs025"})
+    code = om.main(["--store", f"local:{env / 'r2'}"], getter=fake)
+    assert code == 0 and fake.forecasts == 1
+    store = C.LocalStore(cfg, env / "r2")
+    man = _om_manifests(store)
+    assert {m["availability_source"] for m in man.values()} == {"rule_fallback"} and len(man) == 2
+    for m in man.values():
+        df = pd.read_parquet(__import__("io").BytesIO(store.get(m["object_key"])))
+        assert (df["availability_source"] == "rule_fallback").all()
+        assert (df["interval_start_utc"] >= df["forecast_issue_time_utc"]).all()
+    # freshness monitor accepts rule_fallback manifests as valid data
+    st = fm.run(store, cfg, now=C.utcnow())
+    om_st = st["sources"]["openmeteo"]
+    assert om_st["stale"] is False and "openmeteo" not in st["stale_sources"]
+    assert {s["availability_source"] for s in om_st["streams"].values()} == {"rule_fallback"}
+    # next run: metadata is back and reports the same runs -> nothing new is requested
+    runs = {m: int(C.parse_iso(v["forecast_issue_time_utc"]).timestamp()) for m, v in man.items()}
+    ok = FaultyOM({"ncep_gfs013": [runs["gfs_global"]], "ncep_gfs025": [runs["gfs_global"]],
+                   "ecmwf_ifs025": [runs["ecmwf_ifs025"]]})
+    r = om.run(store, cfg, getter=ok)
+    assert ok.forecasts == 0 and len(r["skipped_existing"]) == 2 and om.exit_code(r) == 0
+    # metadata down again: a stored run at least as new as the rule run -> skipped, no duplicate
+    again = FaultyOM({}, meta_timeout={"ncep_gfs013", "ecmwf_ifs025"})
+    r = om.run(store, cfg, getter=again)
+    assert again.forecasts == 0 and {v["status"] for v in r["models"].values()} == {"skipped_existing"}
+
+
+def test_openmeteo_forecast_failure_for_both_exits_3(cfg, env, waits):
+    init = _recent_init()
+    fake = FaultyOM({"ncep_gfs013": [init], "ncep_gfs025": [init], "ecmwf_ifs025": [init]}, forecast_fail=True)
+    code = om.main(["--store", f"local:{env / 'r2'}"], getter=fake)
+    assert code == 3 and not _om_manifests(C.LocalStore(cfg, env / "r2"))
+    # also with metadata failing for both models
+    fake = FaultyOM({}, meta_timeout={"ncep_gfs013", "ecmwf_ifs025"}, forecast_fail=True)
+    assert om.main(["--store", f"local:{env / 'r2'}"], getter=fake) == 3
+
+
+@pytest.mark.parametrize("where", ["meta", "forecast"])
+def test_openmeteo_429_exits_4_without_retry(cfg, env, waits, where):
+    init = _recent_init()
+    fake = FaultyOM({"ncep_gfs013": [init], "ncep_gfs025": [init], "ecmwf_ifs025": [init]}, rate_limit=where)
+    code = om.main(["--store", f"local:{env / 'r2'}"], getter=fake)
+    assert code == 4 and waits == []
+    target = [u for u in fake.urls if ("meta.json" in u) == (where == "meta")]
+    assert len(target) == 1                                    # the 429 request was not retried
+    assert not _om_manifests(C.LocalStore(cfg, env / "r2"))
+
+
+def test_openmeteo_one_failing_metadata_call_waits_at_most_80s(cfg, waits):
+    fake = FaultyOM({}, meta_timeout={"ecmwf_ifs025"})
+    with pytest.raises(requests.exceptions.ReadTimeout):
+        om.model_meta(cfg["openmeteo"], "ecmwf_ifs025", getter=fake)
+    assert fake.timeouts == [(10, 30), (10, 30)] and waits == [15]
+    assert fake.clock_s + sum(waits) == 75 <= 80
+    assert om.FORECAST_TIMEOUT[1] <= 60
 
 
 # ---------------------------------------------------------------- staleness

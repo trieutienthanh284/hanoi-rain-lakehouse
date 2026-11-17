@@ -8,7 +8,9 @@
       gsmap_now  -> window_end_utc           (stale after 120 min by default)
       openmeteo  -> model_availability_time_utc (stale after 720 min; D27)
       imerg_late -> window_end_utc of the day (stale after 2880 min)
-  Thresholds live in configs/realtime.yaml.
+  Thresholds live in configs/realtime.yaml. Open-Meteo manifests written with
+  ``availability_source = "rule_fallback"`` (P3B hotfix) are valid records: their
+  ``model_availability_time_utc`` is the conservative rule time (issue + delay).
 * Exit code 1 when any source/stream is stale or has no record: a failed
   scheduled run makes GitHub e-mail the repository owner (that is the alert).
 """
@@ -71,6 +73,8 @@ def evaluate(now: datetime, records: dict[str, dict], cfg: dict) -> dict:
                                    "ingestion_age_min": None if ing is None else
                                    round((now - C.parse_iso(ing)).total_seconds() / 60, 1),
                                    "stale": age is None or age > limit}
+            if r.get("availability_source"):
+                entry["streams"][s]["availability_source"] = r["availability_source"]
         entry["age_min"] = max((v["age_min"] for v in entry["streams"].values() if v["age_min"] is not None),
                                default=None)
         entry["stale"] = any(v["stale"] for v in entry["streams"].values())
@@ -90,7 +94,8 @@ def run(store: C.Store, cfg: dict, now: datetime | None = None) -> dict:
         for s, key in keys.items():
             m = store.get_json(key)
             records[source][s] = {"key": key, "data_time_utc": m.get(scfg["data_time_field"]),
-                                  "ingestion_time_utc": m.get("ingestion_time_utc")}
+                                  "ingestion_time_utc": m.get("ingestion_time_utc"),
+                                  "availability_source": m.get("availability_source")}
     status = evaluate(now, records, cfg)
     store.put_json(STATUS_KEY, status, overwrite=True)
     status["store"] = store.stats()
