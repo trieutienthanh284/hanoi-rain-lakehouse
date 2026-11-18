@@ -1,0 +1,80 @@
+name: train
+# P4C — cloud training of the PILOT rainfall nowcast (manual start only; see docs/agent_runs/RUNBOOK_CLOUD_TRAINING.md).
+# Inputs come from R2 (lake/v1/data/gold/..., lake/v1/models/...); outputs go to R2 under lake/v1/runs/<job>/<run_id>/
+# and to a 7-day artifact. Re-running the same job resumes: units with a done marker in R2 are skipped.
+# Secrets are referenced by name only and passed as environment variables to one step; GitHub masks them in logs
+# and the code redacts them as well (src/realtime/common.py). Never echo them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "p4a6 (set B + compare A/B) | p4a7 (leave-one-season-out) | p4b (reserved)"
+        required: true
+        type: choice
+        options: [p4a6, p4a7, p4b]
+      part:
+        description: "i/n — split the units across parallel runs (1/1 = all)"
+        required: true
+        default: "1/1"
+        type: string
+      final:
+        description: "p4b only: run the final test evaluation"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: train-${{ inputs.job }}-${{ inputs.part }}
+  cancel-in-progress: false
+
+jobs:
+  train:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements-train.txt
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-train.txt
+      - name: Offline tests of the training entry point
+        env:
+          HFL_P2B_EXCLUDE_SOURCES: imerg_late
+        run: python -m pytest -q tests/test_cloud_train.py tests/test_metrics_pilot.py
+      - name: Train
+        env:
+          PYTHONUNBUFFERED: "1"
+          HFL_P2B_EXCLUDE_SOURCES: imerg_late
+          JOB: ${{ inputs.job }}
+          PART: ${{ inputs.part }}
+          FINAL: ${{ inputs.final }}
+          EARTHDATA_TOKEN: ${{ secrets.EARTHDATA_TOKEN }}
+          GSMAP_FTP_HOST: ${{ secrets.GSMAP_FTP_HOST }}
+          GSMAP_FTP_USER: ${{ secrets.GSMAP_FTP_USER }}
+          GSMAP_FTP_PASSWORD: ${{ secrets.GSMAP_FTP_PASSWORD }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          extra=()
+          if [ "$FINAL" = "true" ]; then extra+=(--final); fi
+          python -m src.models.cloud_train --job "$JOB" --part "$PART" --max-minutes 320 "${extra[@]}"
+      - name: Keep outputs as artifact (7 days)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: train-${{ inputs.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: cloud_out/
+          retention-days: 7
+          if-no-files-found: ignore

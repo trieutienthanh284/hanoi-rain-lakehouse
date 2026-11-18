@@ -1,0 +1,88 @@
+# Phase 4A — PILOT rainfall nowcast v0 (not a product model). See ADD-005.
+version: "pilot_v0"
+random_seed: 42
+
+frames:                       # ADD-005 §1 (user decision 1A, 2026-11-16)
+  analysis_time_step_min: 30  # t0 on every UTC :00 / :30
+  issue_offset_min: 10        # prediction_time = t0 + 10 min
+  frame_length_min: 30        # one IMERG half-hour window
+  lead_min: [0, 30, 60]       # F0, F30, F60 = frame start - t0; target_time = frame end
+
+targets:                      # G4 locked 2026-11-17 (user)
+  source: imerg_final         # labels from IMERG Final only (satellite estimate, not gauges)
+  variable: rain_rate_mm_h
+  operator: ">="
+  thresholds_mm_h: [0.5, 2.5, 7.6]
+  primary_mm_h: 2.5
+  secondary_mm_h: 7.6
+  auxiliary_mm_h: 0.5
+  label_columns: {"0.5": y_0p5, "2.5": y_2p5, "7.6": y_7p6}
+
+scope:
+  start: "2023-05-01"
+  end: "2025-09-30"           # IMERG Final V07 ends 2025-09-30
+  season_months: [5, 6, 7, 8, 9, 10]
+  provisional_late_month: "2025-10"   # labels_provisional (IMERG Late) — not built while Late backfill runs
+  region: city                # 47 city pixels (is_city_pixel)
+  excluded_sources_env: HFL_P2B_EXCLUDE_SOURCES
+
+availability:                 # P4A.1 decision (pilot, all seasons alike)
+  gsmap_now:
+    rule: realtime_measured
+    available_after_window_end_min: 5   # 1.2 min measured on 45 realtime samples + margin
+  openmeteo_rule_file: configs/openmeteo_availability.yaml
+
+features:
+  gsmap_variable_primary: rain_rate_gc_mm_h     # hourlyPrecipRateGC
+  gsmap_variable_raw: rain_rate_mm_h            # hourlyPrecipRate
+  history_k: [0, 1, 2, 3, 4, 5, 6]              # window ending at t0 - 30k
+  wet_mm_h: 0.5
+  cap_mm_h: 200.0
+  minutes_since_wet_cap: 180
+  neighbourhood_k: [0, 2]
+  box_radii_px: [1, 2, 5]
+  ring_deg: [0.3, 1.0]
+  quadrants: [N, E, S, W]
+  groups:                     # group -> kind; columns are listed in table schema.json
+    gsmap: observation
+    calendar: static
+    static: static
+    nwp_gfs: forecast
+    nwp_ecmwf: forecast
+  allowlist_prefixes: ["gc_", "raw_", "nb_", "ring_", "gsmap_", "cal_", "lat", "lon", "nwp_"]
+
+splits:                       # by time only, never by pixel
+  tune: ["2023-05-01", "2024-08-31"]
+  validation: ["2024-09-01", "2024-10-31"]
+  test: ["2025-05-01", "2025-09-30"]
+  ablation_tune_2024_only: ["2024-05-01", "2024-08-31"]
+
+baselines:
+  logistic_features: [gc_k0, gc_k1, nb_r2_mean_k0, nb_r5_wet_k0, cal_hour_sin, cal_hour_cos]
+  persistence_p2b_predictor: {0: asof_latest, 30: asof_latest, 60: max_avail_0_60}
+
+lightgbm:
+  objective: binary
+  learning_rate: 0.05
+  num_leaves: 63
+  min_data_in_leaf: 200
+  feature_fraction: 0.8
+  bagging_fraction: 0.8
+  bagging_freq: 1
+  lambda_l2: 1.0
+  num_boost_round: 2000
+  early_stopping_rounds: 100
+  metric: binary_logloss
+  num_threads: 2
+  verbose: -1
+
+evaluation:
+  bootstrap_resamples: 1000
+  bootstrap_block: day
+  ci_level: 0.90
+  reliability_bins: 10
+  cut_rule: {"0.5": max_csi, "2.5": max_csi, "7.6": freq_bias_1.5}
+
+resources:
+  max_rss_gb: 5.0
+  per_process_target_gb: 3.0
