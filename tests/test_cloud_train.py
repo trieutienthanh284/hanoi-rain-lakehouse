@@ -25,7 +25,6 @@ def test_units_per_job():
         "train-A_no2023-lead0-thr0p5", "train-A_no2023-lead30-thr0p5", "train-A_no2023-lead60-thr0p5"}
     u7 = CT.job_units("p4a7", CFG)
     assert [u.kind for u in u7].count("loso") == 27 and u7[-1].id == "final"
-    assert CT.job_units("p4b", CFG) == []
     assert len({u.id for u in u6}) == len(u6) and len({u.id for u in u7}) == len(u7)
 
 
@@ -122,9 +121,9 @@ def test_driver_resumes_and_writes_markers(tmp_path, capsys, monkeypatch):
     assert '"final": "waiting"' in out                     # other parts still missing -> no final unit
 
 
-def test_reserved_job_exits_2(tmp_path, capsys):
-    rc = C.cli(CT.main, ["--job", "p4b", "--store", f"local:{tmp_path}"])
-    assert rc == 2 and "job_reserved" in capsys.readouterr().out
+def test_final_flag_refused_for_pilot_jobs(tmp_path, capsys):
+    rc = C.cli(CT.main, ["--job", "p4a7", "--final", "--store", f"local:{tmp_path}"])
+    assert rc == 2 and "final_refused" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------- secrets never reach the log

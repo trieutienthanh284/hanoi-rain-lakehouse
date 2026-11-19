@@ -61,3 +61,37 @@ python -m src.models.cloud_train --job p4a7 --plan --store local:<thư mục>   
 python -m pytest -q tests/test_cloud_train.py
 ```
 Không huấn luyện thật trên laptop (RAM trống ≈ 1 GB).
+
+---
+
+# P4B — Mô hình v1 trên GitHub Actions (job `p4b_smoke`, `p4b`)
+
+Định nghĩa đánh giá (D93): CV 2023-05..2024-10 với IMERG Final; test 2025-05..09 với Final, chạy **một lần** khi có `final = true` và người dùng đã duyệt; tháng 10/2025 (IMERG Late) là kiểm tra phụ, báo cáo riêng. Laptop không chạy dữ liệu thật hay huấn luyện (D94).
+
+## P4B.1 Các lần chạy theo thứ tự
+
+| # | Form (job / part / final) | Chạy khi | Song song? | Ước lượng phút runner |
+|---|---|---|---|---|
+| 1 | `p4b_smoke` / `1/1` / `false` | ngay sau khi push | — | 8–15 |
+| 2a | `p4b` / `1/3` / `false` | sau khi agent xác nhận smoke PASS | chạy cùng lúc 2b, 2c | 110–170 mỗi phần |
+| 2b | `p4b` / `2/3` / `false` | như 2a | có | 110–170 |
+| 2c | `p4b` / `3/3` / `false` | như 2a | có | 110–170 |
+| 3 | `p4b` / `1/1` / `true` | chỉ sau khi người dùng đọc báo cáo OOF và agent đã ghi `final_approved = true` | — | 15–30 |
+
+Phương án tuần tự thay cho 2a–2c: `p4b` / `1/1` / `false`, chạy lại cùng input khi hết 320 phút (≈ 2 lần, tổng 330–480 phút).
+
+Các phần song song tự chờ nhau ở mỗi giai đoạn (đọc marker trên R2 mỗi phút, tối đa 120 phút). Nếu log có `waiting_for_other_parts` hoặc `time_budget_reached`, chạy lại **đúng phần đó** với cùng input: job tiếp tục, không làm lại đơn vị đã có marker.
+
+## P4B.2 Kiểm tra log smoke (tách biệt với job thật, D96)
+
+Trong bước **Train** của lần chạy `p4b_smoke`:
+1. Dòng `{"event": "plan", "job": "p4b_smoke", "run_id": "…", "gold_id": "…"}`: `run_id` phải khác run của `p4b`, `gold_id` khác Gold của `p4b` (agent in sẵn cả hai giá trị).
+2. Không dòng nào chứa `OOF_DONE` (tìm bằng ô "Search logs").
+3. Dòng cuối `{"event": "end", … "oof_complete": true, "final": "done"}`: smoke chạy hết, kể cả đơn vị final trên ngày giả-test 2024.
+4. Artifact `train-p4b_smoke-…` chỉ có thư mục `p4b_smoke/<run_id>/`.
+
+Trên R2, smoke chỉ ghi được `lake/v1/runs/p4b_smoke/` và `lake/v1/gold/met_training/table_*_v1/gid=<gold id của smoke>/`; mọi khóa khác bị từ chối (`KeyRefused`).
+
+## P4B.3 Sau khi chạy
+
+Báo agent "p4b_smoke finished" / "p4b OOF finished" / "p4b final finished". Agent lấy kết quả bằng `python -m src.models.fetch_run --job <job>`, viết `REPORT_P4B.md`. Sau phần OOF, agent ghi `lake/v1/reports/p4b/OOF_DONE.json` với `final_approved = false`; chỉ khi người dùng nói chạy test cuối, agent mới ghi lại với `--approve-final`. `--final` bị từ chối (exit 2, `final_refused`) nếu tệp không có, chưa duyệt, hoặc thuộc run khác (mã đã đổi).

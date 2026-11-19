@@ -48,15 +48,16 @@ def month_days(y: int, m: int, cfg: dict) -> list[date]:
     return out
 
 
-def silver_file(d: date) -> Path:
-    P.guard_source(SOURCE)
-    return P.SILVER / SOURCE / f"date={d.isoformat()}" / "part.parquet"
+def silver_file(d: date, source: str = SOURCE) -> Path:
+    P.guard_source(source)
+    return P.SILVER / source / f"date={d.isoformat()}" / "part.parquet"
 
 
-def load_final(days: list[date]) -> pd.DataFrame:
+def load_final(days: list[date], source: str = SOURCE) -> pd.DataFrame:
+    """IMERG Silver rows of the city pixels (source imerg_final; imerg_late only for P4B provisional labels)."""
     parts = []
     for d in days:
-        f = silver_file(d)
+        f = silver_file(d, source)
         if f.is_file():
             t = pd.read_parquet(f, columns=["pixel_id", "interval_start_utc", "rain_rate_mm_h", "is_city_pixel"])
             parts.append(t[t["is_city_pixel"]].drop(columns="is_city_pixel"))
@@ -67,13 +68,15 @@ def load_final(days: list[date]) -> pd.DataFrame:
     return df
 
 
-def build_month(y: int, m: int, cfg: dict, city_pixels: np.ndarray) -> tuple[pd.DataFrame, dict]:
-    days = month_days(y, m, cfg)
+def build_month(y: int, m: int, cfg: dict, city_pixels: np.ndarray, source: str = SOURCE,
+                days: list[date] | None = None) -> tuple[pd.DataFrame, dict]:
+    days = days or month_days(y, m, cfg)
     fr = cfg["frames"]
     nxt = days[-1] + timedelta(days=1)
-    fin = load_final(days + [nxt])
-    t0 = pd.date_range(pd.Timestamp(days[0], tz="UTC"), pd.Timestamp(days[-1], tz="UTC") + pd.Timedelta("1D"),
-                       freq=f"{fr['analysis_time_step_min']}min", inclusive="left")
+    fin = load_final(days + [nxt], source)
+    t0 = pd.DatetimeIndex(np.concatenate([pd.date_range(pd.Timestamp(d, tz="UTC"), periods=24 * 60 // fr['analysis_time_step_min'],
+                                                        freq=f"{fr['analysis_time_step_min']}min").values for d in days]),
+                          tz="UTC")
     grid = pd.MultiIndex.from_product([city_pixels, t0, fr["lead_min"]], names=["pixel_id", "t0", "lead_min"]).to_frame(index=False)
     grid["t0"] = grid["t0"].astype("datetime64[ns, UTC]")
     grid["prediction_time"] = grid["t0"] + pd.Timedelta(minutes=fr["issue_offset_min"])
@@ -90,7 +93,7 @@ def build_month(y: int, m: int, cfg: dict, city_pixels: np.ndarray) -> tuple[pd.
         out[thr_col(t)] = (out["label_rate_mm_h"] >= t).astype("int8")
     for c in ("t0", "prediction_time", "frame_start", "target_time"):
         out[c] = out[c].astype("datetime64[us, UTC]")
-    out["label_source"] = "imerg_final_v07"
+    out["label_source"] = f"{source}_v07"
     out["season"] = np.int16(y)
     out["lead_min"] = out["lead_min"].astype("int16")
     stats = {"season": y, "month": m, "days": len(days), "t0": len(t0), "pixels": int(len(city_pixels)),

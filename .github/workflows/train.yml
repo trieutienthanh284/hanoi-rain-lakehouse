@@ -9,17 +9,17 @@ on:
   workflow_dispatch:
     inputs:
       job:
-        description: "p4a6 (set B + compare A/B) | p4a7 (leave-one-season-out) | p4b (reserved)"
+        description: "p4a6 | p4a7 | p4b_smoke (P4B real-data smoke, first) | p4b (v1: Gold, CV, grid, OOF; final only with final=true)"
         required: true
         type: choice
-        options: [p4a6, p4a7, p4b]
+        options: [p4a6, p4a7, p4b_smoke, p4b]
       part:
         description: "i/n — split the units across parallel runs (1/1 = all)"
         required: true
         default: "1/1"
         type: string
       final:
-        description: "p4b only: run the final test evaluation"
+        description: "p4b only: run the P4B.6 final test (refused unless the user approved it in OOF_DONE.json)"
         required: true
         default: false
         type: boolean
@@ -49,11 +49,16 @@ jobs:
       - name: Offline tests of the training entry point
         env:
           HFL_P2B_EXCLUDE_SOURCES: imerg_late
-        run: python -m pytest -q tests/test_cloud_train.py tests/test_metrics_pilot.py
+        run: |
+          python -m pytest -q tests/test_cloud_train.py tests/test_metrics_pilot.py
+          if [ "${{ inputs.job }}" = "p4b" ] || [ "${{ inputs.job }}" = "p4b_smoke" ]; then
+            python -m pytest -q tests/test_p4b_job.py tests/test_features_v1.py tests/test_p4b_gold_synthetic.py tests/test_p4b_select_synthetic.py
+          fi
       - name: Train
         env:
           PYTHONUNBUFFERED: "1"
-          HFL_P2B_EXCLUDE_SOURCES: imerg_late
+          # pilot jobs keep the P4A guard; P4B reads IMERG Late (October 2025 labels; Late backfill finished 2026-11-19)
+          HFL_P2B_EXCLUDE_SOURCES: ${{ (inputs.job == 'p4b' || inputs.job == 'p4b_smoke') && 'none' || 'imerg_late' }}
           JOB: ${{ inputs.job }}
           PART: ${{ inputs.part }}
           FINAL: ${{ inputs.final }}
@@ -69,6 +74,8 @@ jobs:
           set -euo pipefail
           extra=()
           if [ "$FINAL" = "true" ]; then extra+=(--final); fi
+          # parallel parts of p4b wait for each other at every stage (polling R2 markers once a minute)
+          if [ "$JOB" = "p4b" ]; then extra+=(--wait-minutes 120); fi
           python -m src.models.cloud_train --job "$JOB" --part "$PART" --max-minutes 320 "${extra[@]}"
       - name: Keep outputs as artifact (7 days)
         if: always()

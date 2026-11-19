@@ -1,0 +1,126 @@
+# Phase 4B — rainfall nowcast v1 (TASK_P4B_MODEL_V1.md). Not a flood model; labels are IMERG (satellite estimate).
+# Evaluation definition fixed 2026-11-20 before any model code (D93):
+#   training + blocked CV  2023-05-01 .. 2024-10-31, IMERG Final only
+#   test (P4B.6)           2025-05-01 .. 2025-09-30, IMERG Final, run once with --final after user approval
+#   secondary check        2025-10-01 .. 2025-10-31, IMERG Late (provisional), reported apart, never used for a choice
+version: "v1"
+random_seed: 42
+
+frames:                       # ADD-005, unchanged from pilot v0
+  analysis_time_step_min: 30
+  issue_offset_min: 10
+  frame_length_min: 30
+  lead_min: [0, 30, 60]
+
+targets:                      # G4 locked 2026-11-17 (user)
+  variable: rain_rate_mm_h
+  operator: ">="
+  thresholds_mm_h: [0.5, 2.5, 7.6]
+  primary_mm_h: 2.5
+  secondary_mm_h: 7.6
+  auxiliary_mm_h: 0.5
+  label_columns: {"0.5": y_0p5, "2.5": y_2p5, "7.6": y_7p6}
+
+scope:
+  start: "2023-05-01"
+  end: "2025-10-31"
+  season_months: [5, 6, 7, 8, 9, 10]
+  cv: ["2023-05-01", "2024-10-31"]
+  test: ["2025-05-01", "2025-09-30"]
+  secondary: ["2025-10-01", "2025-10-31"]
+  label_source_default: imerg_final
+  label_source_by_month: {"2025-10": imerg_late}   # IMERG Final 2025-10 does not exist (REPORT_P2B §13.9)
+  nwp_from: "2024-05-01"      # Open-Meteo previous_day1 history (set B)
+  pixel_limit: null           # smoke tests only: first n city pixels
+  max_days_per_month: null    # smoke tests only
+  region: city
+
+availability:                 # P4A.1, unchanged
+  gsmap_now:
+    rule: realtime_measured
+    available_after_window_end_min: 5
+  openmeteo_rule_file: configs/openmeteo_availability.yaml
+
+features:
+  feature_version: v1         # src/gold/features.py: no cal_doy_*, + cal_month, motion, advection, upwind, extent
+  gsmap_variable_primary: rain_rate_gc_mm_h
+  gsmap_variable_raw: rain_rate_mm_h
+  history_k: [0, 1, 2, 3, 4, 5, 6]
+  wet_mm_h: 0.5
+  cap_mm_h: 200.0
+  minutes_since_wet_cap: 180
+  neighbourhood_k: [0, 2]
+  box_radii_px: [1, 2, 5]
+  ring_deg: [0.3, 1.0]
+  quadrants: [N, E, S, W]
+  motion:
+    max_shift_px_per_h: 4     # search window (P4B.2)
+    min_corr: 0.3             # peak cross-correlation of log1p(rate) for motion_valid
+    min_wet_frac: 0.01        # both fields need >= 1 % of the domain >= 0.5 mm/h
+    min_overlap_px: 100
+    window_centre_offset_min: -30   # GSMaP NOW hourly window ending at window_end -> centre 30 min earlier
+    upwind_deg: [0.3, 1.0]
+    upwind_half_angle_deg: 45.0
+    extent_mm_h: [0.5, 2.5]
+  allowlist_prefixes: ["gc_", "raw_", "nb_", "ring_", "gsmap_", "cal_", "lat", "lon", "nwp_",
+                       "motion_", "adv_", "upwind_", "extent_"]
+
+cv:                           # P4B.1
+  folds: calendar_month       # 12 folds = the season months inside scope.cv
+  buffer_days: 1              # training rows within 1 day of the held-out month are dropped (both sides)
+  max_rounds: 3000
+  early_stopping_rounds: 150  # on the held-out month; OOF predictions use the median of the fold optima
+  b_months_from: "2024-05-01" # set B / A-restricted / no-2023 ablation: folds and training rows from here on
+
+lightgbm_p4a:                 # pilot v0 parameters (ablation steps a-d, and the "clear gain" check)
+  objective: binary
+  learning_rate: 0.05
+  num_leaves: 63
+  min_data_in_leaf: 200
+  feature_fraction: 0.8
+  bagging_fraction: 0.8
+  bagging_freq: 1
+  lambda_l2: 1.0
+  metric: binary_logloss
+  num_threads: 4
+  verbose: -1
+
+grid:                         # P4B.3: 8 settings, chosen by pooled OOF log-loss at 2.5 mm/h
+  fixed: {objective: binary, learning_rate: 0.03, feature_fraction: 0.7, bagging_fraction: 0.8, bagging_freq: 1,
+          metric: binary_logloss, num_threads: 4, verbose: -1}
+  num_leaves: [15, 31]
+  min_data_in_leaf: [500, 2000]
+  lambda_l2: [1, 10]
+
+selection:
+  month_feature: "add cal_month only if the mean pooled OOF log-loss over F0/F30/F60 at 2.5 mm/h decreases"
+  other_thresholds_clear_gain_rel: 0.005   # 0.5 / 7.6 mm/h switch to P4A parameters only if OOF log-loss is >= 0.5 % lower
+  calibration: [raw, platt, isotonic]       # cross-fitted on OOF (leave-one-fold-out); raw unless a method lowers
+                                            # OOF Brier with a day-block bootstrap interval below 0
+  cut_bias_band: [0.8, 1.5]
+  heavy_bias: 1.5
+  b_not_worse: "B ships if its OOF Brier at 2.5 mm/h is not significantly worse than A-restricted at any frame"
+
+baselines:
+  logistic_features: [gc_k0, gc_k1, nb_r2_mean_k0, nb_r5_wet_k0, cal_hour_sin, cal_hour_cos]
+
+evaluation:
+  bootstrap_resamples: 1000
+  bootstrap_block: day
+  ci_level: 0.90
+  reliability_bins: 10
+  wettest_days: 10
+
+resources:
+  max_rss_gb: 13.0            # GitHub runner (16 GB)
+  local_min_free_gb: 1.5      # D69: local training calls wait up to 5 min for this much free RAM
+
+smoke:                        # job p4b_smoke (D94): first cloud run on real data, a few minutes; never reads 2025.
+  scope:                      # deep-merged over the sections above
+    cv_periods: [["2024-07-01", "2024-07-10"], ["2024-07-11", "2024-07-20"]]   # 2 folds inside one month
+    test: ["2024-08-01", "2024-08-03"]          # pseudo-test inside the training years (exercises the final unit)
+    secondary: ["2024-09-01", "2024-09-02"]     # pseudo-secondary with IMERG Late labels (exercises the Late path)
+    label_source_by_month: {"2024-09": imerg_late}
+  targets: {thresholds_mm_h: [2.5]}
+  cv: {max_rounds: 300, early_stopping_rounds: 30}
+  grid: {num_leaves: [15], min_data_in_leaf: [500], lambda_l2: [1]}

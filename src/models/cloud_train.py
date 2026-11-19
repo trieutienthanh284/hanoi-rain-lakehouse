@@ -1,8 +1,11 @@
-"""P4C.2 — cloud training entry point (GitHub Actions runner or local), PILOT v0.
+"""P4C.2 / P4B — cloud training entry point (GitHub Actions runner or local): PILOT v0 jobs and the v1 job.
 
   python -m src.models.cloud_train --job p4a6 [--part 1/2] [--store r2|local:<dir>] [--plan]
   python -m src.models.cloud_train --job p4a7 --part 2/3
-  python -m src.models.cloud_train --job p4b [--final]          # reserved, see D77
+  python -m src.models.cloud_train --job p4b_smoke              # P4B: first cloud run on real data (D94)
+  python -m src.models.cloud_train --job p4b [--part 1/3] [--wait-minutes 90]
+  python -m src.models.cloud_train --job p4b --final            # P4B.6, only after the user approved (OOF_DONE.json)
+  python -m src.models.cloud_train --job p4b --write-oof-done [--approve-final]   # local agent step, no training
 
 Jobs (definitions exactly as in TASK_P4A_PILOT_MODEL.md, code imported, never copied):
   p4a6  remaining set-B models (all 9 are (re)trained: the 2 local ones serve as a determinism check),
@@ -41,7 +44,8 @@ from src.realtime import common as C  # noqa: E402
 
 LAKE = "lake/v1/"
 RUNS = LAKE + "runs/"
-JOBS = ("p4a6", "p4a7", "p4b")
+JOBS = ("p4a6", "p4a7", "p4b", "p4b_smoke")
+P4B_JOBS = ("p4b", "p4b_smoke")
 GOLD_REL = "data/gold/met_training/pilot_v0/"
 CODE_FILES = ["src/models/cloud_train.py", "src/models/train_lgbm.py", "src/models/data.py", "src/models/metrics.py",
               "src/models/compare_A_B.py", "src/models/evaluate_lgbm.py", "src/gold/p4a_common.py",
@@ -61,7 +65,6 @@ INPUTS = {
              GOLD_REL + "table_A/season=2025/", GOLD_REL + "preds/baselines_", GOLD_REL + "preds/lgbm_A_no2023_",
              "models/pilot_v0/A_no2023/"],
     "p4a7": [GOLD_REL + "table_A/", GOLD_REL + "preds/lgbm_A_lead"],
-    "p4b": [],
 }
 
 
@@ -91,8 +94,6 @@ def job_units(job: str, cfg: dict) -> list[Unit]:
             for lead in leads:
                 for t in thrs:
                     u.append(Unit(f"loso-{s}-lead{lead}-thr{kstr(t)}", "loso", {"season": s, "lead": lead, "thr": t}))
-    elif job == "p4b":
-        return []
     u.append(Unit("final", "final", {}))
     return u
 
@@ -119,7 +120,11 @@ def part_units(units: list[Unit], i: int, n: int) -> list[Unit]:
 def run_id_for(job: str) -> str:
     import hashlib
     h = hashlib.sha256(job.encode())
-    for f in CODE_FILES:
+    files = CODE_FILES
+    if job in P4B_JOBS:
+        from src.models import p4b as PB
+        files = PB.CODE_FILES
+    for f in files:
         h.update((ROOT / f).read_bytes().replace(b"\r\n", b"\n"))
     return h.hexdigest()[:12]
 
@@ -147,7 +152,11 @@ def latest_key(job: str) -> str:
 
 def open_run_store(spec: str, job: str):
     """Store restricted to lake/v1/runs/<job>/ (puts only; reads anywhere). Only latest.json is overwritable."""
-    cfg = {"remote": {"realtime_prefix": f"{RUNS}{job}/", "status_prefix": f"{RUNS}{job}/",
+    second = f"{RUNS}{job}/"
+    if job in P4B_JOBS:                           # p4b also writes the v1 Gold tables (never overwritten: gold id)
+        from src.models import p4b as PB
+        second = PB.GOLD_REMOTE
+    cfg = {"remote": {"realtime_prefix": f"{RUNS}{job}/", "status_prefix": second,
                       "overwritable_keys": [latest_key(job)], "bucket_env": "R2_BUCKET"}}
     return C.open_store(spec, cfg)
 
@@ -412,16 +421,22 @@ def main(argv=None) -> int:
     ap.add_argument("--run-id", default=None, help="override the code-derived run id")
     ap.add_argument("--max-minutes", type=float, default=320.0, help="stop starting new units after this time")
     ap.add_argument("--plan", action="store_true", help="print the units of this part and their state; train nothing")
+    ap.add_argument("--wait-minutes", type=float, default=0.0,
+                    help="p4b: wait up to this long for other parts to finish a stage (polls R2 markers every 60 s)")
+    ap.add_argument("--write-oof-done", action="store_true",
+                    help="p4b, local agent step: write lake/v1/reports/p4b/OOF_DONE.json for this run (no training)")
+    ap.add_argument("--approve-final", action="store_true",
+                    help="with --write-oof-done: set final_approved = true (only after the user said so)")
     a = ap.parse_args(argv)
     t_start = time.time()
+    if a.job in P4B_JOBS:
+        return main_p4b(a, t_start)
+    if a.final:
+        C.log("final_refused", job=a.job, reason="--final applies to job p4b only")
+        return 2
     from src.gold import p4a_common as P
     P.require_guard()
     cfg = P.load_cfg()
-    if a.job == "p4b":
-        C.log("job_reserved", job="p4b", final=a.final,
-              reason="P4B code (CV folds, motion features, grid, calibration, ablations) is developed under "
-                     "TASK_P4B_MODEL_V1.md after the p4a6 results are read back (P4B.4 depends on P4A.6); D77")
-        return 2
     i, n = parse_part(a.part)
     units = job_units(a.job, cfg)
     mine = part_units(units, i, n)
@@ -478,6 +493,117 @@ def main(argv=None) -> int:
           minutes=round((time.time() - t_start) / 60, 1))
     return 0
 
+
+# ------------------------------------------------------------------------------------------- P4B driver
+def oof_done_store(spec: str):
+    """Store that may write exactly lake/v1/reports/p4b/OOF_DONE.json (local agent step)."""
+    from src.models import p4b as PB
+    pre = PB.OOF_DONE_KEY.rsplit("/", 1)[0] + "/"
+    return C.open_store(spec, {"remote": {"realtime_prefix": pre, "status_prefix": pre,
+                                          "overwritable_keys": [PB.OOF_DONE_KEY], "bucket_env": "R2_BUCKET"}})
+
+
+def write_oof_done(spec: str, run_id: str, approve: bool, run_store) -> dict:
+    from src.models import p4b as PB
+    if "oof-report" not in done_units(run_store, "p4b", run_id):
+        raise SystemExit(f"oof-report of run {run_id} is not done; OOF_DONE.json not written")
+    obj = {"job": "p4b", "run_id": run_id, "oof_report_marker": marker_key("p4b", run_id, "oof-report"),
+           "written_utc": C.iso(C.utcnow()), "final_approved": bool(approve),
+           "note": "final_approved is set to true only after the user read the OOF report and said to run the "
+                   "final test (TASK_P4B_MODEL_V1.md, stop point after P4B.5)"}
+    oof_done_store(spec).put_json(PB.OOF_DONE_KEY, obj, overwrite=True)
+    return obj
+
+
+def main_p4b(a, t_start: float) -> int:
+    from src.models import p4b as PB
+    smoke = a.job == "p4b_smoke"
+    cfg = PB.load_cfg(smoke=smoke)
+    i, n = parse_part(a.part)
+    units = PB.units(cfg)
+    mine = PB.part_units(units, i, n)
+    gates = [u for u in units if u.kind == "gate"]
+    final_u = [u for u in units if u.kind == "final"]
+    run_id = a.run_id or run_id_for(a.job)
+    store = open_run_store(a.store, a.job)
+    if a.write_oof_done:
+        if a.job != "p4b":
+            C.log("refused", reason="--write-oof-done applies to job p4b only")
+            return 2
+        C.log("oof_done", **write_oof_done(a.store, run_id, a.approve_final, store))
+        return 0
+    if a.final and not smoke:
+        ok, why = PB.check_final_guard(store, run_id)
+        if not ok:
+            C.log("final_refused", job=a.job, run_id=run_id, reason=why)
+            return 2
+    elif a.final and smoke:
+        C.log("final_ignored", reason="p4b_smoke runs its final unit on 2024 pseudo-test days automatically")
+    # final unit: p4b only with an approved --final; the smoke job always (2024 pseudo-test days, never 2025)
+    allowed = mine + gates + (final_u if (smoke or a.final) else [])
+    done = done_units(store, a.job, run_id)
+    C.log("plan", job=a.job, run_id=run_id, part=f"{i}/{n}", units_total=len(units), units_in_part=len(mine),
+          done=len(done), todo=[u.id for u in allowed if u.id not in done][:40], final=a.final, smoke=smoke,
+          gold_id=PB.gold_id(cfg))
+    if a.plan:
+        return 0
+    mirror = ROOT / "cloud_out" / a.job / run_id
+    store.put_json(latest_key(a.job), {"job": a.job, "run_id": run_id, "updated_utc": C.iso(C.utcnow()),
+                                       "context": C.run_context()}, overwrite=True)
+    ctx = PB.Ctx(cfg, store, a.job, run_id, mirror, C.log)
+    done_now, last_metrics, waited = [], {}, 0.0
+    while True:
+        if (time.time() - t_start) / 60 > a.max_minutes:
+            C.log("time_budget_reached", hint="run the job again (same inputs): it resumes")
+            break
+        done = done_units(store, a.job, run_id)
+        todo = [u for u in allowed if u.id not in done]
+        if not todo:
+            break
+        ready = [u for u in todo if all(d in done for d in u.deps)]
+        if not ready:
+            low = min(u.stage for u in todo)          # report what blocks the lowest pending stage
+            blocked = sorted({d for u in todo if u.stage == low for d in u.deps if d not in done})
+            if waited >= a.wait_minutes:
+                C.log("waiting_for_other_parts", missing=blocked[:20], n_missing=len(blocked),
+                      hint="start this part again after the other parts have finished; it resumes")
+                break
+            time.sleep(60)
+            waited += 1.0
+            continue
+        u = ready[0]
+        t1 = time.time()
+        C.log("unit_start", unit=u.id)
+        rels, metrics = PB.run_unit(u, ctx)
+        outs = upload_outputs(store, a.job, run_id, rels, mirror)
+        try:
+            write_marker(store, a.job, run_id, u, outs, metrics, mirror)
+        except C.ObjectConflict:                      # a parallel part finished the same gate first
+            C.log("marker_exists", unit=u.id)
+        done_now.append(u.id)
+        if u.kind in ("gate", "final"):
+            last_metrics[u.id] = metrics
+        C.log("unit_done", unit=u.id, seconds=round(time.time() - t1, 1),
+              **{k: v for k, v in metrics.items() if k in ("pooled_logloss", "median_rounds", "rows_A1", "chosen",
+                                                           "feature_set", "ship_B", "violations")})
+    done = done_units(store, a.job, run_id)
+    missing = [u.id for u in units if u.kind != "final" and u.id not in done]
+    if "oof-report" in done_now:
+        store.put_json(run_prefix(a.job, run_id) + "summary.json",
+                       {"job": a.job, "run_id": run_id, "stage": "OOF complete (stop point after P4B.5)",
+                        "metrics": last_metrics.get("oof-report"), "finished_utc": C.iso(C.utcnow()),
+                        "context": C.run_context()})
+    if "final-test" in done_now:
+        store.put_json(run_prefix(a.job, run_id) + "done.json", {"job": a.job, "run_id": run_id,
+                                                                   "finished_utc": C.iso(C.utcnow())})
+    md = step_summary(a.job, run_id, done_now, len(missing), last_metrics or None)
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+            fh.write(C.redact(md))
+    C.log("end", job=a.job, run_id=run_id, part=f"{i}/{n}", finished_now=len(done_now), missing_oof_units=len(missing),
+          oof_complete="oof-report" in done, final=("done" if "final-test" in done else "not run"),
+          store=store.stats(), minutes=round((time.time() - t_start) / 60, 1))
+    return 0
 
 if __name__ == "__main__":
     raise SystemExit(C.cli(main))
