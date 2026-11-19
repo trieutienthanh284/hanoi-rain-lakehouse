@@ -836,6 +836,37 @@ def choose_cut(ctx: Ctx, oof: pd.DataFrame, p: np.ndarray, thr: float) -> dict:
     return out
 
 
+def _finite_interval(d: dict, keys=("csi", "brier")) -> bool:
+    return all(np.isfinite(d[k][x]) for k in keys for x in ("diff", "lo", "hi"))
+
+
+def b_worse_than_a(d: dict, lead: int) -> bool:
+    """Ship rule (P4B.4): B is worse than A-restricted at a frame if the day-block bootstrap interval of
+    Brier(B) - Brier(A) lies above 0 or that of CSI(B) - CSI(A) lies below 0. A NaN anywhere stops the unit:
+    a missing interval is never read as "B not worse"."""
+    if not _finite_interval(d):
+        raise RuntimeError(f"B-vs-A comparison at lead {lead} has a NaN interval: {d['brier']} / {d['csi']}")
+    return bool(d["brier"]["lo"] > 0 or d["csi"]["hi"] < 0)
+
+
+def win_worse(d: dict) -> tuple[bool, bool, bool]:
+    """D64 rule against one baseline: (win, significantly worse, nan interval). A NaN interval is neither."""
+    if not _finite_interval(d):
+        return False, False, True
+    return (bool(d["csi"]["lo"] > 0 and d["brier"]["hi"] < 0), bool(d["csi"]["hi"] < 0 or d["brier"]["lo"] > 0),
+            False)
+
+
+def verdict_of(wins, worse, nan_ivs) -> str:
+    """BEATS_ALL / LOSES / TIES, or UNDETERMINED when an interval is NaN and nothing is significantly worse
+    (a NaN interval is never counted as a tie or a win)."""
+    if any(b for _, b in worse):
+        return "LOSES"
+    if any(x for _, x in nan_ivs):
+        return "UNDETERMINED"
+    return "BEATS_ALL" if all(w for _, w in wins) else "TIES"
+
+
 def chosen_spec(ctx: Ctx, variant: str, thr: float, sel_cache: dict | None = None) -> str:
     if variant == "B":
         return "B24"
@@ -915,7 +946,7 @@ def gate_oof_select(ctx: Ctx) -> tuple[list[str], dict]:
         d = M.paired_bootstrap(_ds(oaj, j["pb"].to_numpy(), j["pb"].to_numpy() >= cut_b),
                                _ds(oaj, j["pa"].to_numpy(), j["pa"].to_numpy() >= cut_a),
                                ev["bootstrap_resamples"], cfg["random_seed"], ev["ci_level"])
-        worse = d["brier"]["lo"] > 0 or d["csi"]["hi"] < 0
+        worse = b_worse_than_a(d, L)                      # raises on a NaN interval (never "not worse")
         bvsa.append({"lead_min": L, "rows": len(j), "brier_B_minus_A": d["brier"], "csi_B_minus_A": d["csi"],
                      "B_worse": bool(worse)})
     sel["ship_B"] = not any(r["B_worse"] for r in bvsa)
@@ -1198,19 +1229,19 @@ def run_final(ctx: Ctx) -> tuple[list[str], dict]:
                     if nm in ("v1", "v1_A", "v1_B"):
                         rel_rows.append(M.reliability(y[okb], p[okb], ev["reliability_bins"]).assign(
                             period=pname, lead_min=L, threshold=t, model=nm))
-                wins, worse = [], []
+                wins, worse, nan_ivs = [], [], []
                 for nm in base:
                     d = M.paired_bootstrap(ds["v1"], ds[nm], ev["bootstrap_resamples"], cfg["random_seed"], ev["ci_level"])
-                    w = d["csi"]["lo"] > 0 and d["brier"]["hi"] < 0
-                    b = d["csi"]["hi"] < 0 or d["brier"]["lo"] > 0
-                    wins.append((nm, w)); worse.append((nm, b))
+                    w, b, nan_iv = win_worse(d)
+                    wins.append((nm, w)); worse.append((nm, b)); nan_ivs.append((nm, nan_iv))
                     diffs.append({"period": pname, "lead_min": L, "threshold": t, "baseline": nm,
                                   "csi_diff": d["csi"]["diff"], "csi_lo": d["csi"]["lo"], "csi_hi": d["csi"]["hi"],
                                   "brier_diff": d["brier"]["diff"], "brier_lo": d["brier"]["lo"],
-                                  "brier_hi": d["brier"]["hi"], "win": w, "significantly_worse": b})
+                                  "brier_hi": d["brier"]["hi"], "win": w, "significantly_worse": b,
+                                  "nan_interval": nan_iv})
                 verd.append({"period": pname, "lead_min": L, "threshold": t,
-                             "verdict": "BEATS_ALL" if all(w for _, w in wins) else
-                             ("LOSES" if any(b for _, b in worse) else "TIES"),
+                             "verdict": verdict_of(wins, worse, nan_ivs),
+                             "nan_interval_vs": ",".join(n for n, x in nan_ivs if x),
                              "wins_vs": ",".join(n for n, w in wins if w), "worse_than": ",".join(n for n, b in worse if b)})
                 mon = df["t0"].dt.tz_convert(LOCAL_TZ).dt.month.to_numpy()
                 for mm in np.unique(mon):

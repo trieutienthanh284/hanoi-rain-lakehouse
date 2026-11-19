@@ -28,6 +28,7 @@ if str(ROOT) not in sys.path:
 from src.models import cloud_train as CT  # noqa: E402
 from src.realtime import common as C  # noqa: E402
 
+MIRROR_ONLY_JOBS = ("p4b_smoke",)   # smoke outputs stay in the mirror; never installed into models/ (D101)
 INSTALL_PREFIXES = ("models/", "data/gold/met_training/pilot_v0/preds/", "reports/p4a/runs/")
 
 
@@ -58,7 +59,7 @@ def fetch(store, job: str, run_id: str, dest: Path) -> dict:
         if not rel_run.startswith("files/"):
             continue
         rel = rel_run[len("files/"):]
-        if not rel.startswith(INSTALL_PREFIXES) or ".." in rel.split("/"):
+        if job in MIRROR_ONLY_JOBS or not rel.startswith(INSTALL_PREFIXES) or ".." in rel.split("/"):
             continue
         dst = dest / rel
         if dst.is_file():

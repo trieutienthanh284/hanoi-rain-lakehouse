@@ -280,3 +280,41 @@ def test_smoke_final_reads_only_2024_rows(tmp_path, monkeypatch):
     met = pd.read_csv(ws / "reports/p4b/final/metrics.csv")
     assert "pilot_v0" not in set(met["model"]) and set(met["period"]) == {"test", "secondary"}
     assert {"v1", "v1_A", "v1_B", "pers", "calpers", "clim", "logit"} <= set(met["model"])
+
+
+# ---------------------------------------------------------------- NaN intervals never pass a decision (D101)
+def _d(csi=(0.0, -0.01, 0.01), brier=(0.0, -0.001, 0.001)):
+    return {"csi": dict(zip(("diff", "lo", "hi"), csi)), "brier": dict(zip(("diff", "lo", "hi"), brier))}
+
+
+def test_ship_rule_fails_loudly_on_nan():
+    assert PB.b_worse_than_a(_d(), 0) is False                                   # interval contains 0
+    assert PB.b_worse_than_a(_d(brier=(0.002, 0.001, 0.003)), 0) is True          # Brier significantly higher
+    assert PB.b_worse_than_a(_d(csi=(-0.02, -0.03, -0.01)), 0) is True            # CSI significantly lower
+    for bad in (_d(csi=(0.0, float("nan"), 0.01)), _d(brier=(0.0, -0.001, float("nan"))),
+                _d(csi=(float("nan"),) * 3)):
+        with pytest.raises(RuntimeError, match="NaN interval"):
+            PB.b_worse_than_a(bad, 30)
+
+
+def test_final_verdict_marks_nan_intervals():
+    w, b, n = PB.win_worse(_d(csi=(0.0, float("nan"), float("nan"))))
+    assert (w, b, n) == (False, False, True)
+    assert PB.win_worse(_d(csi=(0.05, 0.02, 0.08), brier=(-0.002, -0.003, -0.001))) == (True, False, False)
+    assert PB.verdict_of([("a", True), ("b", False)], [("a", False), ("b", False)], [("a", False), ("b", True)]) \
+        == "UNDETERMINED"
+    assert PB.verdict_of([("a", True)], [("a", False)], [("a", False)]) == "BEATS_ALL"
+    assert PB.verdict_of([("a", False), ("b", False)], [("a", True), ("b", False)], [("a", False), ("b", True)]) \
+        == "LOSES"
+
+
+def test_fetch_smoke_is_mirror_only(tmp_path):
+    from src.models import fetch_run as FR
+    st = CT.open_run_store(f"local:{tmp_path / 'store'}", "p4b_smoke")
+    pre = CT.run_prefix("p4b_smoke", "s9")
+    st.put(pre + "files/models/v1/A/lead0_thr2p5/model.txt", b"smoke-model")
+    st.put(pre + "markers/final-test.done.json", b"{}")
+    dest = tmp_path / "repo"
+    log = FR.fetch(st, "p4b_smoke", "s9", dest)
+    assert log["installed"] == [] and not (dest / "models").exists()
+    assert (dest / "reports/p4b_smoke/cloud/s9/files/models/v1/A/lead0_thr2p5/model.txt").read_bytes() == b"smoke-model"
