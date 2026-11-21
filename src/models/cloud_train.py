@@ -6,6 +6,8 @@
   python -m src.models.cloud_train --job p4b [--part 1/3] [--wait-minutes 90]
   python -m src.models.cloud_train --job p4b --final            # P4B.6, only after the user approved (OOF_DONE.json)
   python -m src.models.cloud_train --job p4b --write-oof-done [--approve-final]   # local agent step, no training
+  python -m src.models.cloud_train --job p4b_smoke --race-drill  # re-run the gates of a finished smoke run (race check)
+  python -m src.models.cloud_train --job p4b_post                # post-final outputs of run c0df12477947 (no training)
 
 Jobs (definitions exactly as in TASK_P4A_PILOT_MODEL.md, code imported, never copied):
   p4a6  remaining set-B models (all 9 are (re)trained: the 2 local ones serve as a determinism check),
@@ -17,12 +19,14 @@ Jobs (definitions exactly as in TASK_P4A_PILOT_MODEL.md, code imported, never co
 Remote layout (R2, everything under lake/v1/runs/<job>/; nothing is ever deleted):
   lake/v1/runs/<job>/<run_id>/files/<repo-relative path>     outputs (models, preds, reports, run records)
   lake/v1/runs/<job>/<run_id>/markers/<unit>.done.json       one per finished unit (commit marker)
-  lake/v1/runs/<job>/<run_id>/summary.json, done.json        written by the final unit
+  lake/v1/runs/<job>/<run_id>/summary.json, done.json        written by the final unit (p4b: only by the part
+                                                             that wrote the unit's marker, REPORT_P4B §3.5)
   lake/v1/runs/<job>/latest.json                             pointer to the newest run id (only overwritable key)
 Inputs are read from lake/v1/<repo-relative path> (synced by src/lake/r2_sync.py, P4C.1).
 run_id = hash of the job, configs/model_pilot.yaml and the training code: re-running the same code resumes the
 same run (finished units are skipped); changed code starts a new run. A local mirror of every uploaded file is
-kept in cloud_out/<job>/<run_id>/ (GitHub Actions artifact, 7 days).
+kept in cloud_out/<job>/<run_id>/ (GitHub Actions artifact, 7 days). The GitHub step summary is written to
+cloud_out/step_summary_<job>.md and appended by the workflow only when the Train step succeeded.
 Secrets: only from the environment; all output goes through src.realtime.common's redacting streams.
 """
 from __future__ import annotations
@@ -44,8 +48,11 @@ from src.realtime import common as C  # noqa: E402
 
 LAKE = "lake/v1/"
 RUNS = LAKE + "runs/"
-JOBS = ("p4a6", "p4a7", "p4b", "p4b_smoke")
+JOBS = ("p4a6", "p4a7", "p4b", "p4b_smoke", "p4b_post")
 P4B_JOBS = ("p4b", "p4b_smoke")
+POST_JOBS = ("p4b_post",)        # post-final outputs; reads a fixed p4b run, never trains (src/models/p4b_post.py)
+SUMMARY_TITLE = {"p4a6": "PILOT v0", "p4a7": "PILOT v0", "p4b": "v1 (P4B)", "p4b_smoke": "v1 smoke (P4B, 2024 only)",
+                 "p4b_post": "P4B post-final (no training, no test re-scoring)"}
 GOLD_REL = "data/gold/met_training/pilot_v0/"
 CODE_FILES = ["src/models/cloud_train.py", "src/models/train_lgbm.py", "src/models/data.py", "src/models/metrics.py",
               "src/models/compare_A_B.py", "src/models/evaluate_lgbm.py", "src/gold/p4a_common.py",
@@ -124,6 +131,9 @@ def run_id_for(job: str) -> str:
     if job in P4B_JOBS:
         from src.models import p4b as PB
         files = PB.CODE_FILES
+    elif job in POST_JOBS:
+        from src.models import p4b_post as PP
+        files = PP.CODE_FILES
     for f in files:
         h.update((ROOT / f).read_bytes().replace(b"\r\n", b"\n"))
     return h.hexdigest()[:12]
@@ -223,6 +233,42 @@ def write_marker(store, job: str, run_id: str, unit: Unit, outputs: dict, metric
     m = mirror / "markers" / f"{unit.id}.done.json"
     m.parent.mkdir(parents=True, exist_ok=True)
     m.write_text(json.dumps(obj, indent=1, default=str), encoding="utf-8")
+
+
+def marker_exists(store, job: str, run_id: str, unit_id: str) -> bool:
+    k = marker_key(job, run_id, unit_id)
+    return k in store.list(k)
+
+
+def commit_unit(store, job: str, run_id: str, unit: Unit, rels: list[str], metrics: dict, mirror: Path) -> dict:
+    """Upload a finished unit and write its marker, safely when parallel parts run the same gate (REPORT_P4B §3.5).
+
+    won      this part wrote the marker (only then may it write summary.json / done.json);
+    skipped  the marker already existed: nothing is uploaded (the other part's outputs stay untouched);
+    lost     the marker appeared between the check and the write: outputs were uploaded, the marker is the other
+             part's; `mismatch` lists output keys whose sha256 differs from that marker (R2 then disagrees with it).
+    """
+    if marker_exists(store, job, run_id, unit.id):
+        C.log("marker_exists_skip_upload", unit=unit.id)
+        return {"state": "skipped", "mismatch": []}
+    outs = upload_outputs(store, job, run_id, rels, mirror)
+    try:
+        write_marker(store, job, run_id, unit, outs, metrics, mirror)
+        return {"state": "won", "mismatch": []}
+    except C.ObjectConflict:
+        other = json.loads(store.get(marker_key(job, run_id, unit.id))).get("outputs", {})
+        mismatch = sorted(k for k, v in outs.items() if other.get(k) != v)
+        C.log("marker_lost", unit=unit.id, outputs=len(outs), mismatch=len(mismatch))
+        return {"state": "lost", "mismatch": mismatch}
+
+
+def write_step_summary(job: str, md: str) -> Path:
+    """The step summary goes to a file named after the job; the workflow appends it to $GITHUB_STEP_SUMMARY only
+    when the Train step succeeded (never a file of another job or of an earlier run)."""
+    p = ROOT / "cloud_out" / f"step_summary_{job}.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(C.redact(md), encoding="utf-8")
+    return p
 
 
 # ------------------------------------------------------------------------------------------- training units
@@ -396,9 +442,11 @@ FINALS = {"p4a6": final_p4a6, "p4a7": final_p4a7}
 
 
 # ------------------------------------------------------------------------------------------- driver
-def step_summary(job: str, run_id: str, done_now: list[str], todo_left: int, final_metrics: dict | None) -> str:
-    lines = [f"### cloud_train `{job}` run `{run_id}` (PILOT v0)", "",
-             f"- units finished in this invocation: {len(done_now)}; trainable units still missing: {todo_left}"]
+def step_summary(job: str, run_id: str, done_now: list[str], todo_left: int, final_metrics: dict | None,
+                 extra: list[str] | None = None) -> str:
+    lines = [f"### cloud_train `{job}` run `{run_id}` ({SUMMARY_TITLE.get(job, job)})", "",
+             f"- units finished in this invocation: {len(done_now)}; units still missing: {todo_left}"]
+    lines += [f"- {x}" for x in (extra or [])]
     if done_now:
         lines.append(f"- {', '.join(done_now[:30])}{' …' if len(done_now) > 30 else ''}")
     if final_metrics:
@@ -427,10 +475,18 @@ def main(argv=None) -> int:
                     help="p4b, local agent step: write lake/v1/reports/p4b/OOF_DONE.json for this run (no training)")
     ap.add_argument("--approve-final", action="store_true",
                     help="with --write-oof-done: set final_approved = true (only after the user said so)")
+    ap.add_argument("--race-drill", action="store_true",
+                    help="p4b_smoke only: after the normal loop, run every finished gate and the final unit again; "
+                         "each must be skipped without upload and without rewriting summary.json / done.json")
     a = ap.parse_args(argv)
     t_start = time.time()
+    if a.race_drill and a.job != "p4b_smoke":
+        C.log("refused", reason="--race-drill applies to job p4b_smoke only")
+        return 2
     if a.job in P4B_JOBS:
         return main_p4b(a, t_start)
+    if a.job in POST_JOBS:
+        return main_post(a, t_start)
     if a.final:
         C.log("final_refused", job=a.job, reason="--final applies to job p4b only")
         return 2
@@ -484,10 +540,7 @@ def main(argv=None) -> int:
         (mirror / "summary.json").write_text(json.dumps(summary, indent=1, default=str), encoding="utf-8")
     elif "final" in done:
         C.log("final_already_done", job=a.job, run_id=run_id)
-    md = step_summary(a.job, run_id, done_now, len(missing), final_metrics)
-    if os.environ.get("GITHUB_STEP_SUMMARY"):
-        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
-            fh.write(C.redact(md))
+    write_step_summary(a.job, step_summary(a.job, run_id, done_now, len(missing), final_metrics))
     C.log("end", job=a.job, run_id=run_id, finished_now=len(done_now), missing_trainable=len(missing),
           final=("done" if final_metrics or "final" in done else "waiting"), store=store.stats(),
           minutes=round((time.time() - t_start) / 60, 1))
@@ -551,12 +604,58 @@ def main_p4b(a, t_start: float) -> int:
     store.put_json(latest_key(a.job), {"job": a.job, "run_id": run_id, "updated_utc": C.iso(C.utcnow()),
                                        "context": C.run_context()}, overwrite=True)
     ctx = PB.Ctx(cfg, store, a.job, run_id, mirror, C.log)
-    done_now, last_metrics, waited = [], {}, 0.0
+    res = drive(a, t_start, store, a.job, run_id, allowed, lambda u: PB.run_unit(u, ctx), mirror)
+    won = res["won"]
+    if a.race_drill:                                  # smoke only (checked in main)
+        res["drill"] = race_drill(store, a.job, run_id, gates + final_u, lambda u: PB.run_unit(u, ctx), mirror)
+    done = done_units(store, a.job, run_id)
+    missing = [u.id for u in units if u.kind != "final" and u.id not in done]
+    if "oof-report" in won:
+        store.put_json(run_prefix(a.job, run_id) + "summary.json",
+                       {"job": a.job, "run_id": run_id, "stage": "OOF complete (stop point after P4B.5)",
+                        "metrics": res["metrics"].get("oof-report"), "finished_utc": C.iso(C.utcnow()),
+                        "context": C.run_context()})
+    if "final-test" in won:
+        store.put_json(run_prefix(a.job, run_id) + "done.json", {"job": a.job, "run_id": run_id,
+                                                                   "finished_utc": C.iso(C.utcnow())})
+    extra = [f"part {i}/{n}; final = {a.final}; race drill = {a.race_drill}", *_race_lines(res)]
+    write_step_summary(a.job, step_summary(a.job, run_id, won, len(missing), res["metrics"] or None, extra))
+    C.log("end", job=a.job, run_id=run_id, part=f"{i}/{n}", finished_now=len(won), missing_oof_units=len(missing),
+          oof_complete="oof-report" in done, final=("done" if "final-test" in done else "not run"),
+          skipped=len(res["skipped"]), lost=len(res["lost"]), output_mismatch=len(res["mismatch"]),
+          race_drill=res.get("drill"), store=store.stats(), minutes=round((time.time() - t_start) / 60, 1))
+    return _exit_code(res)
+
+
+def _race_lines(res: dict) -> list[str]:
+    out = []
+    if res["skipped"] or res["lost"]:
+        out.append(f"units run here but committed by another part: skipped {res['skipped']}, lost {res['lost']}")
+    if res["mismatch"]:
+        out.append(f"**output mismatch with the winning marker: {res['mismatch'][:10]}**")
+    if res.get("drill"):
+        out.append(f"race drill: {json.dumps(res['drill'])}")
+    return out
+
+
+def _exit_code(res: dict) -> int:
+    """3 = R2 outputs disagree with a marker written by another part (lost race, different bytes) or a failed
+    race drill; the run is then not trustworthy until checked (fetch_run --verify)."""
+    if res["mismatch"] or (res.get("drill") and not res["drill"]["ok"]):
+        return 3
+    return 0
+
+
+def drive(a, t_start: float, store, job: str, run_id: str, allowed: list, run_unit, mirror: Path) -> dict:
+    """Stage loop shared by p4b, p4b_smoke and p4b_post: run every allowed unit whose dependencies have markers,
+    wait for other parts up to --wait-minutes, commit each unit with commit_unit()."""
+    res = {"won": [], "skipped": [], "lost": [], "mismatch": [], "metrics": {}}
+    waited = 0.0
     while True:
         if (time.time() - t_start) / 60 > a.max_minutes:
             C.log("time_budget_reached", hint="run the job again (same inputs): it resumes")
             break
-        done = done_units(store, a.job, run_id)
+        done = done_units(store, job, run_id)
         todo = [u for u in allowed if u.id not in done]
         if not todo:
             break
@@ -574,36 +673,83 @@ def main_p4b(a, t_start: float) -> int:
         u = ready[0]
         t1 = time.time()
         C.log("unit_start", unit=u.id)
-        rels, metrics = PB.run_unit(u, ctx)
-        outs = upload_outputs(store, a.job, run_id, rels, mirror)
-        try:
-            write_marker(store, a.job, run_id, u, outs, metrics, mirror)
-        except C.ObjectConflict:                      # a parallel part finished the same gate first
-            C.log("marker_exists", unit=u.id)
-        done_now.append(u.id)
-        if u.kind in ("gate", "final"):
-            last_metrics[u.id] = metrics
-        C.log("unit_done", unit=u.id, seconds=round(time.time() - t1, 1),
+        rels, metrics = run_unit(u)
+        c = commit_unit(store, job, run_id, u, rels, metrics, mirror)
+        res[c["state"]].append(u.id)
+        res["mismatch"] += c["mismatch"]
+        if c["state"] == "won" and u.kind in ("gate", "final"):
+            res["metrics"][u.id] = metrics
+        C.log("unit_done", unit=u.id, state=c["state"], seconds=round(time.time() - t1, 1),
               **{k: v for k, v in metrics.items() if k in ("pooled_logloss", "median_rounds", "rows_A1", "chosen",
-                                                           "feature_set", "ship_B", "violations")})
+                                                           "feature_set", "ship_B", "violations", "rows")})
+    return res
+
+
+def race_drill(store, job: str, run_id: str, units: list, run_unit, mirror: Path) -> dict:
+    """Cloud check of the race fix on a finished smoke run: every gate / final unit is run again and committed
+    through commit_unit(); each must come back 'skipped' (marker exists: no upload, no marker, no summary)."""
+    pre = run_prefix(job, run_id)
+    done = done_units(store, job, run_id)
+
+    def _sums() -> dict:
+        return {k: C.sha256_bytes(store.get(pre + k)) for k in ("summary.json", "done.json")
+                if pre + k in store.list(pre + k)}
+
+    def _outputs() -> dict:
+        return {k: C.sha256_bytes(store.get(k)) for k in sorted(store.list(pre + "files/"))}
+
+    before, files_before = _sums(), _outputs()
+    states = {}
+    for u in units:
+        if u.id not in done:
+            states[u.id] = "not_done"
+            continue
+        rels, metrics = run_unit(u)
+        states[u.id] = commit_unit(store, job, run_id, u, rels, metrics, mirror)["state"]
+    after, files_after = _sums(), _outputs()
+    ok = (bool(states) and all(v == "skipped" for v in states.values()) and before == after
+          and len(before) == 2 and files_before == files_after)
+    C.log("race_drill", ok=ok, states=states, summary_and_done_unchanged=before == after,
+          outputs_unchanged=files_before == files_after, present=sorted(before))
+    return {"ok": ok, "states": states}
+
+
+def main_post(a, t_start: float) -> int:
+    """p4b_post: post-final outputs of the fixed run p4b/c0df12477947 (no training, no test re-scoring).
+    Writes only under lake/v1/runs/p4b_post/<run_id>/ (store restriction)."""
+    from src.models import p4b_post as PP
+    if a.final or a.write_oof_done or a.approve_final:
+        C.log("refused", reason="p4b_post never runs --final / --write-oof-done / --approve-final")
+        return 2
+    run_id = a.run_id or run_id_for(a.job)
+    store = open_run_store(a.store, a.job)
+    units = PP.units()
+    C.log("plan", job=a.job, run_id=run_id, source_job=PP.SOURCE_JOB, source_run_id=PP.SOURCE_RUN,
+          source_gold_id=PP.SOURCE_GOLD, units=len(units), done=len(done_units(store, a.job, run_id)))
+    if a.plan:
+        return 0
+    mirror = ROOT / "cloud_out" / a.job / run_id
+    store.put_json(latest_key(a.job), {"job": a.job, "run_id": run_id, "updated_utc": C.iso(C.utcnow()),
+                                       "context": C.run_context()}, overwrite=True)
+    pctx = PP.PostCtx(store, run_id, C.log)
+    res = drive(a, t_start, store, a.job, run_id, units, lambda u: PP.run_unit(u, pctx), mirror)
     done = done_units(store, a.job, run_id)
-    missing = [u.id for u in units if u.kind != "final" and u.id not in done]
-    if "oof-report" in done_now:
+    missing = [u.id for u in units if u.id not in done]
+    if "post-report" in res["won"]:
         store.put_json(run_prefix(a.job, run_id) + "summary.json",
-                       {"job": a.job, "run_id": run_id, "stage": "OOF complete (stop point after P4B.5)",
-                        "metrics": last_metrics.get("oof-report"), "finished_utc": C.iso(C.utcnow()),
+                       {"job": a.job, "run_id": run_id, "source": f"{PP.SOURCE_JOB}/{PP.SOURCE_RUN}",
+                        "stage": "post-final outputs complete", "note": PP.NOT_FLOOD,
+                        "metrics": res["metrics"].get("post-report"), "finished_utc": C.iso(C.utcnow()),
                         "context": C.run_context()})
-    if "final-test" in done_now:
         store.put_json(run_prefix(a.job, run_id) + "done.json", {"job": a.job, "run_id": run_id,
                                                                    "finished_utc": C.iso(C.utcnow())})
-    md = step_summary(a.job, run_id, done_now, len(missing), last_metrics or None)
-    if os.environ.get("GITHUB_STEP_SUMMARY"):
-        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
-            fh.write(C.redact(md))
-    C.log("end", job=a.job, run_id=run_id, part=f"{i}/{n}", finished_now=len(done_now), missing_oof_units=len(missing),
-          oof_complete="oof-report" in done, final=("done" if "final-test" in done else "not run"),
-          store=store.stats(), minutes=round((time.time() - t_start) / 60, 1))
-    return 0
+    extra = [f"source run `{PP.SOURCE_JOB}/{PP.SOURCE_RUN}` (read only), gold `{PP.SOURCE_GOLD}`", PP.NOT_FLOOD,
+             *_race_lines(res)]
+    write_step_summary(a.job, step_summary(a.job, run_id, res["won"], len(missing), res["metrics"] or None, extra))
+    C.log("end", job=a.job, run_id=run_id, finished_now=len(res["won"]), missing=len(missing),
+          done="post-report" in done, store=store.stats(), minutes=round((time.time() - t_start) / 60, 1))
+    return _exit_code(res)
+
 
 if __name__ == "__main__":
     raise SystemExit(C.cli(main))

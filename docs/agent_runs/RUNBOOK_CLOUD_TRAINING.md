@@ -95,3 +95,27 @@ Trên R2, smoke chỉ ghi được `lake/v1/runs/p4b_smoke/` và `lake/v1/gold/m
 ## P4B.3 Sau khi chạy
 
 Báo agent "p4b_smoke finished" / "p4b OOF finished" / "p4b final finished". Agent lấy kết quả bằng `python -m src.models.fetch_run --job <job>`, viết `REPORT_P4B.md`. Sau phần OOF, agent ghi `lake/v1/reports/p4b/OOF_DONE.json` với `final_approved = false`; chỉ khi người dùng nói chạy test cuối, agent mới ghi lại với `--approve-final`. `--final` bị từ chối (exit 2, `final_refused`) nếu tệp không có, chưa duyệt, hoặc thuộc run khác (mã đã đổi).
+
+# P4B sau lượt final — thay đổi cloud một lần (bước 4 của kế hoạch, 2026-11-21)
+
+Nội dung thay đổi: (i) sửa race REPORT_P4B §3.5 (`commit_unit`: chỉ part ghi được marker mới ghi `summary.json` / `done.json`; marker đã có thì không tải output lên); (ii) step summary ghi ra `cloud_out/step_summary_<job>.md`, workflow chỉ chép vào trang GitHub khi bước Train thành công, ngược lại ghi một dòng "Train step failed, no summary"; (iii) `periods.json` ghi nguồn nhãn theo kỳ; (iv) job mới `p4b_post` chỉ đọc run `p4b/c0df12477947` (run id cố định, sha256 theo marker), không huấn luyện, không chạy lại hay chấm lại test, chỉ ghi `lake/v1/runs/p4b_post/<run_id>/`.
+
+Run id sau thay đổi: `p4b` → `02be2f85f454` (**không chạy**: sẽ là một lượt CV mới ≈ 165 phút; `--final` bị từ chối vì `OOF_DONE.json` gắn với `c0df12477947`), `p4b_smoke` → `10161c20403f`, `p4b_post` → `fe6059a77ff1`. Gold id không đổi (`0803d9d8ed72`; smoke `790a59df4110`).
+
+## Thứ tự chạy (form: job / part / final / race_drill)
+
+| # | Form | Khi nào | Song song? | Ước lượng phút runner |
+|---|---|---|---|---|
+| 1a | `p4b_smoke` / `1/2` / `false` / `false` | ngay sau khi push | dispatch 1a và 1b cách nhau < 1 phút | 8–15 |
+| 1b | `p4b_smoke` / `2/2` / `false` / `false` | cùng lúc 1a | có | 8–15 |
+| 2 | `p4b_smoke` / `1/1` / `false` / `true` | sau khi cả 1a, 1b xanh | — | 3–8 |
+| 3 | `p4b_post` / `1/1` / `false` / `false` | sau bước 2 (độc lập; có thể chạy song song với 1–2) | — | 5–15 |
+
+Kiểm tra race (rẻ, chỉ trên tiền tố smoke):
+- 1a/1b: hai part cùng thấy các gate sẵn sàng; part nào ghi marker trước thì thắng. Cả hai run phải **xanh** (mã cũ: part thua dừng với `ObjectConflict` trên `summary.json`). Trong log Train, các dòng `marker_exists_skip_upload` hoặc `marker_lost` (nếu có) cho biết race thực sự xảy ra. `marker_lost` kèm `mismatch` > 0 → exit 3, báo agent.
+- 2 (`race_drill = true`): chạy lại mọi gate và đơn vị final của run smoke đã xong. Mỗi đơn vị phải ra `skipped`, `summary.json` / `done.json` và mọi output giữ nguyên byte. Dòng log `{"event": "race_drill", "ok": true, …}`; `ok: false` → exit 3.
+- Agent: `python -m src.models.fetch_run --job p4b_smoke --run-id 10161c20403f --verify` (mọi output khớp sha256 trong marker, không tệp thừa, có `summary.json` và `done.json`).
+
+Sau bước 3: báo agent "p4b_post finished". Agent chạy `python -m src.models.fetch_run --job p4b_post --run-id fe6059a77ff1 --verify` (chỉ chép vào `reports/p4b_post/cloud/…`, không cài gì vào `models/`).
+
+Ghi chú: đơn vị `feat-*` của run smoke mới ghi lại các phân vùng Gold smoke (cùng gid `790a59df4110`, cùng nội dung) như mọi run smoke trước (hành vi có sẵn, chỉ trong tiền tố Gold của smoke).

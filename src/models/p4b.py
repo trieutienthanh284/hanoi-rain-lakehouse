@@ -1156,7 +1156,6 @@ def run_final(ctx: Ctx) -> tuple[list[str], dict]:
         ctx.fetch_lake(["models/pilot_v0/predict_manifest.json"], "models/pilot_v0/")
         pilot_var = json.loads(man_p.read_text(encoding="utf-8"))["threshold_variant"] if man_p.is_file() else {}
     rows, diffs, verd, months, rel_rows, wet = [], [], [], [], [], []
-    names = {"test": "test (IMERG Final)", "secondary": "secondary (IMERG Late, provisional; never used for choices)"}
     for pname in ("test", "secondary"):
         per = [periods[pname]]
         for L in leads:
@@ -1273,8 +1272,7 @@ def run_final(ctx: Ctx) -> tuple[list[str], dict]:
     pd.DataFrame(wet).to_csv(out / "wettest_days.csv", index=False)
     if rel_rows:
         pd.concat(rel_rows, ignore_index=True).to_csv(out / "reliability.csv", index=False)
-    write_json(out / "periods.json", {k: names[k] for k in names} | {
-        "test": [str(x) for x in period(cfg, "test")], "secondary": [str(x) for x in period(cfg, "secondary")]})
+    write_json(out / "periods.json", {k: period_record(cfg, k) for k in ("test", "secondary")})
     rels = [rel(p) for p in sorted(out.rglob("*")) if p.is_file()]
     v = pd.DataFrame(verd)
     return rels, {"verdicts": v.to_dict("records")[:30]}
@@ -1287,6 +1285,25 @@ def final_periods(cfg: dict) -> dict:
         limit = pd.Timestamp("2025-01-01", tz="UTC")
         assert all(b <= limit for _, b in out.values()), "smoke final must not read 2025"
     return out
+
+
+LABEL_NAMES = {"imerg_final": "IMERG Final V07 (satellite estimate)",
+               "imerg_late": "IMERG Late V07 (provisional; satellite estimate)"}
+PERIOD_ROLE = {"test": "test season (run once after user approval)",
+               "secondary": "secondary out-of-sample check, reported apart, never used for any choice"}
+
+
+def period_record(cfg: dict, name: str) -> dict:
+    """periods.json entry: [from, to) on t0 (UTC) and the label source of every month in it (fixes the run
+    c0df12477947 file, where the label names were overwritten by the date lists)."""
+    a, b = period(cfg, name)
+    months = pd.period_range(a.tz_convert(None).to_period("M"), (b - pd.Timedelta("1ns")).tz_convert(None)
+                             .to_period("M"), freq="M")
+    by_month = {f"{m.year}-{m.month:02d}": label_source(cfg, m.year, m.month) for m in months}
+    srcs = sorted(set(by_month.values()))
+    return {"t0_from_utc": str(a), "t0_to_utc_exclusive": str(b), "role": PERIOD_ROLE[name],
+            "label_source": srcs[0] if len(srcs) == 1 else srcs, "label_source_by_month": by_month,
+            "label_name": " + ".join(LABEL_NAMES.get(x, x) for x in srcs)}
 
 
 def pilot_comparison_enabled(cfg: dict) -> bool:

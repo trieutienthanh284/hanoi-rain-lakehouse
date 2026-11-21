@@ -1,6 +1,6 @@
 """P4C.4 — read back a cloud training run from R2 (read-only on R2).
 
-  python -m src.models.fetch_run --job p4a6 [--run-id latest] [--store r2|local:<dir>]
+  python -m src.models.fetch_run --job p4a6 [--run-id latest] [--store r2|local:<dir>] [--verify]
 
 * Everything under lake/v1/runs/<job>/<run_id>/ is mirrored to reports/<job>/cloud/<run_id>/ (files/, markers/,
   summary.json, done.json).
@@ -10,6 +10,9 @@
   _archive/fetch_run/<job>/<run_id>/<path> (never deleted), then replaced. Every action is listed in
   reports/<job>/cloud/<run_id>/fetch_log.json.
 * Reports (reports/p4a/...) produced in the cloud stay in the mirror; the local REPORT is written from them.
+* --verify (after the fetch, read only): every output listed in every marker must exist in the mirror with the
+  marker's sha256, no mirrored file may be unlisted, and summary.json / done.json are reported; exit 1 otherwise
+  (race-fix check, REPORT_P4B §3.5).
 """
 from __future__ import annotations
 
@@ -28,7 +31,7 @@ if str(ROOT) not in sys.path:
 from src.models import cloud_train as CT  # noqa: E402
 from src.realtime import common as C  # noqa: E402
 
-MIRROR_ONLY_JOBS = ("p4b_smoke",)   # smoke outputs stay in the mirror; never installed into models/ (D101)
+MIRROR_ONLY_JOBS = ("p4b_smoke", "p4b_post")   # smoke outputs stay in the mirror; never installed into models/ (D101)
 INSTALL_PREFIXES = ("models/", "data/gold/met_training/pilot_v0/preds/", "reports/p4a/runs/")
 
 
@@ -79,18 +82,53 @@ def fetch(store, job: str, run_id: str, dest: Path) -> dict:
     return log
 
 
+def verify(mirror: Path, job: str, run_id: str) -> dict:
+    """Markers vs mirrored bytes (the mirror is an exact copy of the run prefix right after fetch())."""
+    pre = CT.run_prefix(job, run_id) + "files/"
+    listed, bad, missing = {}, [], []
+    markers = sorted((mirror / "markers").glob("*.done.json"))
+    for m in markers:
+        for key, sha in json.loads(m.read_text(encoding="utf-8")).get("outputs", {}).items():
+            rel = key[len(pre):] if key.startswith(pre) else None
+            if rel is None:
+                bad.append(key)
+                continue
+            listed[rel] = sha
+            f = mirror / "files" / rel
+            if not f.is_file():
+                missing.append(rel)
+            elif _sha(f.read_bytes()) != sha:
+                bad.append(rel)
+    have = {p.relative_to(mirror / "files").as_posix() for p in (mirror / "files").rglob("*") if p.is_file()}         if (mirror / "files").is_dir() else set()
+    unlisted = sorted(have - set(listed))
+    out = {"markers": len(markers), "outputs": len(listed), "sha_mismatch": bad, "missing": missing,
+           "unlisted": unlisted, "summary_json": (mirror / "summary.json").is_file(),
+           "done_json": (mirror / "done.json").is_file()}
+    out["ok"] = not (bad or missing or unlisted)
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--job", required=True, choices=CT.JOBS)
     ap.add_argument("--run-id", default="latest")
     ap.add_argument("--store", default="r2")
     ap.add_argument("--dest-root", default=None, help="tests only: install below this directory instead of the repo")
+    ap.add_argument("--verify", action="store_true", help="after the fetch: check every marker output (sha256)")
     a = ap.parse_args(argv)
     store = CT.open_run_store(a.store, a.job)          # reads only; puts would be restricted to runs/<job>/
     run_id = resolve_run_id(store, a.job, a.run_id)
     log = fetch(store, a.job, run_id, Path(a.dest_root) if a.dest_root else ROOT)
     C.log("fetched", job=a.job, run_id=run_id, objects=log["objects"], bytes=log["bytes"],
           installed=len(log["installed"]), identical=log["identical"], archived=len(log["archived"]))
+    if a.verify:
+        dest = Path(a.dest_root) if a.dest_root else ROOT
+        v = verify(dest / "reports" / a.job / "cloud" / run_id, a.job, run_id)
+        C.log("verified", job=a.job, run_id=run_id, ok=v["ok"], markers=v["markers"], outputs=v["outputs"],
+              sha_mismatch=len(v["sha_mismatch"]), missing=len(v["missing"]), unlisted=len(v["unlisted"]),
+              summary_json=v["summary_json"], done_json=v["done_json"], first_problems=(v["sha_mismatch"] +
+                                                                                        v["missing"] + v["unlisted"])[:10])
+        return 0 if v["ok"] else 1
     return 0
 
 
