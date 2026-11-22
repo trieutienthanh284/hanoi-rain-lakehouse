@@ -8,6 +8,8 @@
   python -m src.models.cloud_train --job p4b --write-oof-done [--approve-final]   # local agent step, no training
   python -m src.models.cloud_train --job p4b_smoke --race-drill  # re-run the gates of a finished smoke run (race check)
   python -m src.models.cloud_train --job p4b_post                # post-final outputs of run c0df12477947 (no training)
+  python -m src.models.cloud_train --job p4d_smoke               # P4D: minutes-long check of every p4d code path
+  python -m src.models.cloud_train --job p4d --part 2/5 --wait-minutes 150   # P4D.3-P4D.7 (stops at COMPARE_DONE)
 
 Jobs (definitions exactly as in TASK_P4A_PILOT_MODEL.md, code imported, never copied):
   p4a6  remaining set-B models (all 9 are (re)trained: the 2 local ones serve as a determinism check),
@@ -48,11 +50,14 @@ from src.realtime import common as C  # noqa: E402
 
 LAKE = "lake/v1/"
 RUNS = LAKE + "runs/"
-JOBS = ("p4a6", "p4a7", "p4b", "p4b_smoke", "p4b_post")
+JOBS = ("p4a6", "p4a7", "p4b", "p4b_smoke", "p4b_post", "p4d", "p4d_smoke")
 P4B_JOBS = ("p4b", "p4b_smoke")
 POST_JOBS = ("p4b_post",)        # post-final outputs; reads a fixed p4b run, never trains (src/models/p4b_post.py)
+P4D_JOBS = ("p4d", "p4d_smoke")  # v2 candidates cut vs weight (src/models/p4d.py); no --final in this phase
 SUMMARY_TITLE = {"p4a6": "PILOT v0", "p4a7": "PILOT v0", "p4b": "v1 (P4B)", "p4b_smoke": "v1 smoke (P4B, 2024 only)",
-                 "p4b_post": "P4B post-final (no training, no test re-scoring)"}
+                 "p4b_post": "P4B post-final (no training, no test re-scoring)",
+                 "p4d": "v2 candidates cut vs weight (P4D, LOSO OOF only)",
+                 "p4d_smoke": "v2 smoke (P4D, short blocks, 2.5 mm/h only)"}
 GOLD_REL = "data/gold/met_training/pilot_v0/"
 CODE_FILES = ["src/models/cloud_train.py", "src/models/train_lgbm.py", "src/models/data.py", "src/models/metrics.py",
               "src/models/compare_A_B.py", "src/models/evaluate_lgbm.py", "src/gold/p4a_common.py",
@@ -134,6 +139,9 @@ def run_id_for(job: str) -> str:
     elif job in POST_JOBS:
         from src.models import p4b_post as PP
         files = PP.CODE_FILES
+    elif job in P4D_JOBS:
+        from src.models import p4d as PD
+        files = PD.CODE_FILES
     for f in files:
         h.update((ROOT / f).read_bytes().replace(b"\r\n", b"\n"))
     return h.hexdigest()[:12]
@@ -166,6 +174,9 @@ def open_run_store(spec: str, job: str):
     if job in P4B_JOBS:                           # p4b also writes the v1 Gold tables (never overwritten: gold id)
         from src.models import p4b as PB
         second = PB.GOLD_REMOTE
+    elif job in P4D_JOBS:                         # p4d writes Gold table_v2 (lake/v1/gold/met_training/table_v2/)
+        from src.models import p4d as PD
+        second = PD.GOLD_REMOTE
     cfg = {"remote": {"realtime_prefix": f"{RUNS}{job}/", "status_prefix": second,
                       "overwritable_keys": [latest_key(job)], "bucket_env": "R2_BUCKET"}}
     return C.open_store(spec, cfg)
@@ -260,6 +271,69 @@ def commit_unit(store, job: str, run_id: str, unit: Unit, rels: list[str], metri
         mismatch = sorted(k for k, v in outs.items() if other.get(k) != v)
         C.log("marker_lost", unit=unit.id, outputs=len(outs), mismatch=len(mismatch))
         return {"state": "lost", "mismatch": mismatch}
+
+
+def _mirror(mirror: Path, rel: str, data: bytes) -> None:
+    m = mirror / "files" / rel
+    m.parent.mkdir(parents=True, exist_ok=True)
+    m.write_bytes(data)
+
+
+def commit_unit_safe(store, job: str, run_id: str, unit: Unit, rels: list[str], metrics: dict, mirror: Path) -> dict:
+    """commit_unit for jobs whose output files are deterministic (p4d: no timings inside outputs). Outputs are put
+    without overwrite first (identical bytes -> 'exists_identical'); a key that exists with other bytes is replaced
+    only while the unit has no marker (leftover of an interrupted attempt). If the marker appeared meanwhile, nothing
+    is overwritten: state 'lost' with the keys whose sha256 differs from the winning marker (REPORT_P4B §8.1)."""
+    if marker_exists(store, job, run_id, unit.id):
+        C.log("marker_exists_skip_upload", unit=unit.id)
+        return {"state": "skipped", "mismatch": []}
+    outs, conflicts = {}, []
+    for rel in rels:
+        p = ROOT / rel
+        if not p.is_file():
+            continue
+        key, data = file_key(job, run_id, rel), p.read_bytes()
+        outs[key] = C.sha256_bytes(data)
+        try:
+            store.put(key, data)
+            _mirror(mirror, rel, data)
+        except C.ObjectConflict:
+            conflicts.append((key, rel, data))
+
+    def _lost() -> dict:
+        other = json.loads(store.get(marker_key(job, run_id, unit.id))).get("outputs", {})
+        mismatch = sorted(k for k, v in outs.items() if other.get(k) != v)
+        C.log("marker_lost", unit=unit.id, outputs=len(outs), mismatch=len(mismatch))
+        return {"state": "lost", "mismatch": mismatch}
+    if conflicts:
+        if marker_exists(store, job, run_id, unit.id):
+            return _lost()
+        for key, rel, data in conflicts:                 # own leftovers of an attempt without marker
+            store.overwritable.add(key)
+            try:
+                store.put(key, data, overwrite=True)
+            finally:
+                store.overwritable.discard(key)
+            _mirror(mirror, rel, data)
+        C.log("replaced_unmarked_outputs", unit=unit.id, n=len(conflicts))
+    try:
+        write_marker(store, job, run_id, unit, outs, metrics, mirror)
+        return {"state": "won", "mismatch": []}
+    except C.ObjectConflict:
+        return _lost()
+
+
+def parts_lock(store, job: str, run_id: str, n: int) -> tuple[bool, int]:
+    """A run is split into one fixed number of parts: the first invocation records n; any later invocation with
+    another n is refused (prevents 1/1 and 1/2 of the same run from running on top of each other, REPORT_P4B §8.1)."""
+    key = run_prefix(job, run_id) + "parts.json"
+    if key not in store.list(key):
+        try:
+            store.put_json(key, {"job": job, "run_id": run_id, "parts": n, "written_utc": C.iso(C.utcnow())})
+        except C.ObjectConflict:
+            pass
+    n0 = int(json.loads(store.get(key))["parts"])
+    return n0 == n, n0
 
 
 def write_step_summary(job: str, md: str) -> Path:
@@ -487,6 +561,8 @@ def main(argv=None) -> int:
         return main_p4b(a, t_start)
     if a.job in POST_JOBS:
         return main_post(a, t_start)
+    if a.job in P4D_JOBS:
+        return main_p4d(a, t_start)
     if a.final:
         C.log("final_refused", job=a.job, reason="--final applies to job p4b only")
         return 2
@@ -646,9 +722,11 @@ def _exit_code(res: dict) -> int:
     return 0
 
 
-def drive(a, t_start: float, store, job: str, run_id: str, allowed: list, run_unit, mirror: Path) -> dict:
-    """Stage loop shared by p4b, p4b_smoke and p4b_post: run every allowed unit whose dependencies have markers,
-    wait for other parts up to --wait-minutes, commit each unit with commit_unit()."""
+def drive(a, t_start: float, store, job: str, run_id: str, allowed: list, run_unit, mirror: Path,
+          commit=None) -> dict:
+    """Stage loop shared by p4b, p4b_smoke, p4b_post and p4d: run every allowed unit whose dependencies have markers,
+    wait for other parts up to --wait-minutes, commit each unit with commit_unit() (p4d: commit_unit_safe())."""
+    commit = commit or commit_unit
     res = {"won": [], "skipped": [], "lost": [], "mismatch": [], "metrics": {}}
     waited = 0.0
     while True:
@@ -674,14 +752,17 @@ def drive(a, t_start: float, store, job: str, run_id: str, allowed: list, run_un
         t1 = time.time()
         C.log("unit_start", unit=u.id)
         rels, metrics = run_unit(u)
-        c = commit_unit(store, job, run_id, u, rels, metrics, mirror)
+        c = commit(store, job, run_id, u, rels, metrics, mirror)
         res[c["state"]].append(u.id)
         res["mismatch"] += c["mismatch"]
         if c["state"] == "won" and u.kind in ("gate", "final"):
             res["metrics"][u.id] = metrics
         C.log("unit_done", unit=u.id, state=c["state"], seconds=round(time.time() - t1, 1),
               **{k: v for k, v in metrics.items() if k in ("pooled_logloss", "median_rounds", "rows_A1", "chosen",
-                                                           "feature_set", "ship_B", "violations", "rows")})
+                                                           "feature_set", "ship_B", "violations", "rows", "kept",
+                                                           "chain_end", "ring", "cut", "rss_gb", "train_rows",
+                                                           "r2_total_gb", "projected_total_gb", "a1_equal",
+                                                           "ring_pixels", "gold_bytes", "alias", "rows_ring")})
     return res
 
 
@@ -748,6 +829,56 @@ def main_post(a, t_start: float) -> int:
     write_step_summary(a.job, step_summary(a.job, run_id, res["won"], len(missing), res["metrics"] or None, extra))
     C.log("end", job=a.job, run_id=run_id, finished_now=len(res["won"]), missing=len(missing),
           done="post-report" in done, store=store.stats(), minutes=round((time.time() - t_start) / 60, 1))
+    return _exit_code(res)
+
+
+def main_p4d(a, t_start: float) -> int:
+    """p4d / p4d_smoke: P4D.3-P4D.7 in one run (Gold table_v2, LOSO fits, selection gates, comparison). Stops at
+    compare-done (COMPARE_DONE.json); no --final, no OOF_DONE, no race drill in this phase."""
+    from src.models import p4d as PD
+    if a.final or a.write_oof_done or a.approve_final or a.race_drill:
+        C.log("refused", job=a.job, reason="p4d has no --final / --write-oof-done / --approve-final / --race-drill")
+        return 2
+    smoke = a.job == "p4d_smoke"
+    cfg = PD.load_cfg(smoke=smoke)
+    i, n = parse_part(a.part)
+    units = PD.units(cfg)
+    mine = PD.part_units(units, i, n)
+    gates = [u for u in units if u.kind == "gate"]
+    run_id = a.run_id or run_id_for(a.job)
+    store = open_run_store(a.store, a.job)
+    done = done_units(store, a.job, run_id)
+    C.log("plan", job=a.job, run_id=run_id, part=f"{i}/{n}", units_total=len(units), units_in_part=len(mine),
+          done=len(done), todo=[u.id for u in mine + gates if u.id not in done][:40], smoke=smoke,
+          gold_id=PD.gold_id(cfg), note=PD.NOT_FLOOD)
+    if a.plan:
+        return 0
+    ok, n0 = parts_lock(store, a.job, run_id, n)
+    if not ok:
+        C.log("refused", job=a.job, run_id=run_id, reason=f"this run is split into {n0} parts; got --part {i}/{n}")
+        return 2
+    mirror = ROOT / "cloud_out" / a.job / run_id
+    store.put_json(latest_key(a.job), {"job": a.job, "run_id": run_id, "updated_utc": C.iso(C.utcnow()),
+                                       "context": C.run_context()}, overwrite=True)
+    ctx = PD.Ctx(cfg, store, a.job, run_id, mirror, C.log)
+    res = drive(a, t_start, store, a.job, run_id, mine + gates, lambda u: PD.run_unit(u, ctx), mirror,
+                commit=commit_unit_safe)
+    done = done_units(store, a.job, run_id)
+    missing = [u.id for u in units if u.id not in done]
+    if "compare-done" in res["won"]:
+        summ = {"job": a.job, "run_id": run_id, "gold_id": PD.gold_id(cfg), "stage": "P4D.7 comparison complete",
+                "metrics": res["metrics"].get("compare-done"), "finished_utc": C.iso(C.utcnow()),
+                "note": PD.NOT_FLOOD, "context": C.run_context()}
+        store.put_json(run_prefix(a.job, run_id) + "summary.json", summ)
+        store.put_json(run_prefix(a.job, run_id) + "COMPARE_DONE.json",
+                       {"job": a.job, "run_id": run_id, "compare_marker": marker_key(a.job, run_id, "compare-done"),
+                        "finished_utc": summ["finished_utc"],
+                        "note": "stop point after P4D.7: the user chooses Model 1 or Model 2 after the report"})
+    extra = [f"part {i}/{n}; gold `{PD.gold_id(cfg)}`", PD.NOT_FLOOD, *_race_lines(res)]
+    write_step_summary(a.job, step_summary(a.job, run_id, res["won"], len(missing), res["metrics"] or None, extra))
+    C.log("end", job=a.job, run_id=run_id, part=f"{i}/{n}", finished_now=len(res["won"]), missing=len(missing),
+          compare_complete="compare-done" in done, skipped=len(res["skipped"]), lost=len(res["lost"]),
+          output_mismatch=len(res["mismatch"]), store=store.stats(), minutes=round((time.time() - t_start) / 60, 1))
     return _exit_code(res)
 
 

@@ -53,14 +53,15 @@ def silver_file(d: date, source: str = SOURCE) -> Path:
     return P.SILVER / source / f"date={d.isoformat()}" / "part.parquet"
 
 
-def load_final(days: list[date], source: str = SOURCE) -> pd.DataFrame:
-    """IMERG Silver rows of the city pixels (source imerg_final; imerg_late only for P4B provisional labels)."""
+def load_final(days: list[date], source: str = SOURCE, city_only: bool = True) -> pd.DataFrame:
+    """IMERG Silver rows of the city pixels (source imerg_final; imerg_late only for P4B provisional labels).
+    city_only=False keeps every domain pixel (P4D buffer ring); the caller's pixel grid then selects the rows."""
     parts = []
     for d in days:
         f = silver_file(d, source)
         if f.is_file():
             t = pd.read_parquet(f, columns=["pixel_id", "interval_start_utc", "rain_rate_mm_h", "is_city_pixel"])
-            parts.append(t[t["is_city_pixel"]].drop(columns="is_city_pixel"))
+            parts.append((t[t["is_city_pixel"]] if city_only else t).drop(columns="is_city_pixel"))
     if not parts:
         return pd.DataFrame(columns=["pixel_id", "interval_start_utc", "rain_rate_mm_h"])
     df = pd.concat(parts, ignore_index=True)
@@ -69,11 +70,12 @@ def load_final(days: list[date], source: str = SOURCE) -> pd.DataFrame:
 
 
 def build_month(y: int, m: int, cfg: dict, city_pixels: np.ndarray, source: str = SOURCE,
-                days: list[date] | None = None) -> tuple[pd.DataFrame, dict]:
+                days: list[date] | None = None, city_only: bool = True) -> tuple[pd.DataFrame, dict]:
+    """city_pixels: the pixels of the label grid (P4D passes city + ring pixels with city_only=False)."""
     days = days or month_days(y, m, cfg)
     fr = cfg["frames"]
     nxt = days[-1] + timedelta(days=1)
-    fin = load_final(days + [nxt], source)
+    fin = load_final(days + [nxt], source, city_only=city_only)
     t0 = pd.DatetimeIndex(np.concatenate([pd.date_range(pd.Timestamp(d, tz="UTC"), periods=24 * 60 // fr['analysis_time_step_min'],
                                                         freq=f"{fr['analysis_time_step_min']}min").values for d in days]),
                           tz="UTC")

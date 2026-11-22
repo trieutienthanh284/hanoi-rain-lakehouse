@@ -119,3 +119,33 @@ Kiểm tra race (rẻ, chỉ trên tiền tố smoke):
 Sau bước 3: báo agent "p4b_post finished". Agent chạy `python -m src.models.fetch_run --job p4b_post --run-id fe6059a77ff1 --verify` (chỉ chép vào `reports/p4b_post/cloud/…`, không cài gì vào `models/`).
 
 Ghi chú: đơn vị `feat-*` của run smoke mới ghi lại các phân vùng Gold smoke (cùng gid `790a59df4110`, cùng nội dung) như mọi run smoke trước (hành vi có sẵn, chỉ trong tiền tố Gold của smoke).
+
+# P4D — Model v2: "cắt" (Model 1) và "trọng số" (Model 2) trên GitHub Actions (job `p4d_smoke`, `p4d`)
+
+Một job làm trọn P4D.3 → P4D.7: Gold `table_v2` (47 pixel thành phố + 177 pixel vành đệm, lề ≥ 7 px, 2023-05 … 2025-10; D181), LOSO 3 fold, M0 → M1a → M1b, lưới Model 2 (8 thiết lập), so sánh, rồi **dừng** ở `COMPARE_DONE.json`. Không có `final`, không có `race_drill`, không đọc 2022. Thiết kế: `configs/model_v2.yaml`, REPORT_P4D §1–§2, D169–D183.
+
+Định danh (tính từ mã đã publish; đổi nếu mã đổi): `p4d` run `84679b7ec0cf`, gold `a4a6329bcf13`; `p4d_smoke` run `793004743201`, gold `68c63e533e62`.
+
+## P4D.1 Thứ tự chạy (form: job / part / final / race_drill)
+
+| # | Form | Khi nào | Ước lượng |
+|---|---|---|---|
+| 1 | `p4d_smoke` / `1/1` / `false` / `false` | ngay sau khi push | ≈ 30 phút runner |
+| 2 | agent kiểm tra smoke (`fetch_run --job p4d_smoke --run-id 793004743201 --verify`) | sau khi 1 xanh | cục bộ, chỉ đọc |
+| 3 | `p4d` / `1/13` … `13/13` / `false` / `false` | sau khi agent báo smoke PASS; dispatch 13 phần cách nhau < 5 phút | ≈ 250 phút phần chậm nhất (≈ 2 300 phút runner tổng) |
+
+- **Giữ đúng 13 phần cho cả run.** Lần chạy đầu ghi `parts.json`; mọi lần chạy cùng run với số phần khác bị từ chối (exit 2, `refused … split into 13 parts`). Khi một phần dừng (`time_budget_reached`, `waiting_for_other_parts`, lỗi mạng), chạy lại **đúng phần đó** (`i/13`): đơn vị có marker được bỏ qua.
+- Các phần chờ nhau ở mỗi giai đoạn (đọc marker R2 mỗi phút, tối đa 150 phút): 0 preflight → 1 feat (18 tháng) → 2 g2 → 3 base + M0 + M1a → sel-m1a → 4 M1b → sel-m1b → 5 Model 1 (0,5/7,6) + lưới Model 2 (144 đơn vị, phần lớn thời gian) → sel-m2 → 6 Model 2 0,5 → 7 cmp-main, cmp-detail → 8 compare-done.
+- `--max-minutes 320`, `timeout-minutes 350` như P4B. Gói GitHub miễn phí cho 20 job song song; nếu ít hơn 13, các phần xếp hàng: phần đến sau có thể hết `--wait-minutes` khi chờ ở gate → chạy lại đúng phần đó. Không đổi số phần.
+
+## P4D.2 Dòng log cần kiểm tra (bước **Train**)
+
+1. `{"event": "plan", "job": "p4d_smoke", "run_id": "cd317e638365", …, "gold_id": "daf4deb2b58e"}` (smoke) / `"job": "p4d", "run_id": "fc90d9b3362e", …, "gold_id": "24df8ebdbbde"` (thật).
+2. `{"event": "unit_done", "unit": "preflight", …, "r2_total_gb": …, "projected_total_gb": …, "ring_pixels": 177, "ring_margin_px": 7}` (smoke: `ring_pixels` 4): `projected_total_gb` ≤ 6,0 (ước lượng sát ngưỡng, ≈ 5,9). Nếu vượt, unit lỗi (`preflight FAIL`), không có gì được dựng; báo agent.
+3. `{"event": "unit_done", "unit": "g2", …, "violations": 0, "a1_equal": true, "ring_pixels": 177}` (smoke: 4). Tóm tắt `ring_coverage` (`ring_coverage_min` ≈ 0,84, `ring_coverage_mean` ≈ 0,96, `ring_pixels_truncated` 144; smoke theo 4 pixel được chọn) nằm trong marker / `reports/p4d/g2/summary.json` và `truncation_city_vs_ring.csv`.
+4. `{"event": "unit_done", "unit": "fit-…", …, "rss_gb": …}`: mọi `rss_gb` ≤ 10 (ước ≈ 5,7 cho đơn vị có vành; unit tự lỗi nếu vượt).
+5. `sel-m1a` (`kept`), `sel-m1b` (`kept`, `chain_end`, `ring`, `cut`), `sel-m2` (`chosen`).
+6. Dòng cuối mỗi phần `{"event": "end", …, "lost": 0, "output_mismatch": 0, …}`; ở phần thắng `compare-done`: `"compare_complete": true`. Exit 3 hoặc `output_mismatch` > 0 → báo agent, không chạy lại.
+7. Không dòng nào chứa `OOF_DONE` hay `final_refused`; các `unit_start` `feat-…` chỉ có tháng 2023-05 … 2025-10 (smoke: 2023-05, 2024-10, 2025-05, 2025-10). Dòng `FINAL: false` trong phần env của bước là bình thường.
+
+Trên R2, job chỉ ghi được `lake/v1/runs/<job>/` và `lake/v1/gold/met_training/table_v2/gid=<gold id>/` (khóa khác: `KeyRefused`). Báo agent "p4d_smoke finished" rồi "p4d finished"; agent chạy `python -m src.models.fetch_run --job p4d --run-id 84679b7ec0cf --verify` (chỉ chép vào `reports/p4d/cloud/…`) và viết phần kết quả của REPORT_P4D.

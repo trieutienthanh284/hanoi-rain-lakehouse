@@ -405,6 +405,11 @@ def feature_columns(df: pd.DataFrame) -> list[str]:
 
 
 def group_of(col: str) -> str:
+    """Exact column names first (P4D: ring_coverage is static although it starts with the gsmap prefix ring_),
+    then prefixes ending in '_'. Unchanged for every pre-P4D column."""
+    for g, prefixes in FEATURE_GROUPS_A.items():
+        if col in prefixes:
+            return g
     for g, prefixes in FEATURE_GROUPS_A.items():
         if col in prefixes or any(col.startswith(pr) for pr in prefixes if pr.endswith("_")):
             return g
@@ -488,3 +493,51 @@ def compute_nwp_features(rows: pd.DataFrame, om: pd.DataFrame, pmap: dict) -> pd
 
 FEATURE_GROUPS_A.update({"nwp_gfs": ("nwp_gfs_",), "nwp_ecmwf": ("nwp_ecmwf_",)})
 GROUP_KIND.update({"nwp_gfs": "forecast", "nwp_ecmwf": "forecast"})
+
+
+# ------------------------------------------------------------------ P4D: static pixel columns (city + buffer ring)
+EARTH_RADIUS_KM = 6371.0088
+FEATURE_GROUPS_A.update({"pixel_static": ("dist_to_city_center_km", "is_city", "ring_coverage")})
+GROUP_KIND.update({"pixel_static": "static"})
+
+
+def _annulus_offsets(ring: tuple[float, float], res: float) -> tuple[np.ndarray, np.ndarray]:
+    n = int(np.ceil(ring[1] / res)) + 1
+    di, dj = np.meshgrid(np.arange(-n, n + 1), np.arange(-n, n + 1), indexing="ij")
+    d = np.hypot(di * res, dj * res)
+    m = (d >= ring[0] - 1e-9) & (d <= ring[1] + 1e-9)            # same tolerance as ring_quadrants
+    return di[m], dj[m]
+
+
+def ring_coverage(pixel_ids: np.ndarray, ring: tuple[float, float], grid: Grid = Grid()) -> np.ndarray:
+    """Share of the ring_deg annulus cells (as used by ring_quadrants) that lie inside the domain grid."""
+    oi, oj = _annulus_offsets(ring, grid.res)
+    ii, jj = grid.ij(np.asarray(pixel_ids, dtype="int64"))
+    ri, rj = ii[:, None] + oi[None], jj[:, None] + oj[None]
+    inside = (ri >= 0) & (ri < grid.n_lat) & (rj >= 0) & (rj < grid.n_lon)
+    return inside.mean(axis=1)
+
+
+def city_centre(city_pixels: np.ndarray, grid: Grid = Grid()) -> tuple[float, float]:
+    """Mean latitude / longitude of the city pixel centres (deg)."""
+    lat, lon = grid.latlon(np.asarray(city_pixels))
+    return float(np.mean(lat)), float(np.mean(lon))
+
+
+def pixel_static_columns(pixel_ids: np.ndarray, city_pixels: np.ndarray, centre: tuple[float, float],
+                         grid: Grid = Grid(), ring: tuple[float, float] | None = None) -> pd.DataFrame:
+    """Per pixel: great-circle distance (km) from its centre to the city centre, 1.0 for city pixels, and (when
+    ring is given) ring_coverage = share of the ring annulus inside the domain, 1.0 for city pixels.
+    Pure function of the pixel id; serving calls it with the same city set and centre (is_city = 1)."""
+    pid = np.asarray(pixel_ids, dtype="int64")
+    lat, lon = grid.latlon(pid)
+    p1, p2 = np.radians(lat), np.radians(centre[0])
+    dphi, dlmb = p2 - p1, np.radians(centre[1] - lon)
+    a = np.sin(dphi / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dlmb / 2) ** 2
+    d = 2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+    is_city = np.isin(pid, np.asarray(city_pixels, dtype="int64"))
+    out = pd.DataFrame({"pixel_id": pid, "dist_to_city_center_km": d.astype("float32"),
+                        "is_city": is_city.astype("float32")})
+    if ring is not None:
+        out["ring_coverage"] = np.where(is_city, 1.0, ring_coverage(pid, ring, grid)).astype("float32")
+    return out

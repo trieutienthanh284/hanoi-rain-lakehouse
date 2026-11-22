@@ -31,7 +31,7 @@ if str(ROOT) not in sys.path:
 from src.models import cloud_train as CT  # noqa: E402
 from src.realtime import common as C  # noqa: E402
 
-MIRROR_ONLY_JOBS = ("p4b_smoke", "p4b_post")   # smoke outputs stay in the mirror; never installed into models/ (D101)
+MIRROR_ONLY_JOBS = ("p4b_smoke", "p4b_post", "p4d", "p4d_smoke")   # outputs stay in the mirror; never installed (D101)
 INSTALL_PREFIXES = ("models/", "data/gold/met_training/pilot_v0/preds/", "reports/p4a/runs/")
 
 
@@ -103,7 +103,7 @@ def verify(mirror: Path, job: str, run_id: str) -> dict:
     unlisted = sorted(have - set(listed))
     out = {"markers": len(markers), "outputs": len(listed), "sha_mismatch": bad, "missing": missing,
            "unlisted": unlisted, "summary_json": (mirror / "summary.json").is_file(),
-           "done_json": (mirror / "done.json").is_file()}
+           "done_json": (mirror / "done.json").is_file(), "compare_done_json": (mirror / "COMPARE_DONE.json").is_file()}
     out["ok"] = not (bad or missing or unlisted)
     return out
 
@@ -126,7 +126,8 @@ def main(argv=None) -> int:
         v = verify(dest / "reports" / a.job / "cloud" / run_id, a.job, run_id)
         C.log("verified", job=a.job, run_id=run_id, ok=v["ok"], markers=v["markers"], outputs=v["outputs"],
               sha_mismatch=len(v["sha_mismatch"]), missing=len(v["missing"]), unlisted=len(v["unlisted"]),
-              summary_json=v["summary_json"], done_json=v["done_json"], first_problems=(v["sha_mismatch"] +
+              summary_json=v["summary_json"], done_json=v["done_json"], compare_done_json=v["compare_done_json"],
+              first_problems=(v["sha_mismatch"] +
                                                                                         v["missing"] + v["unlisted"])[:10])
         return 0 if v["ok"] else 1
     return 0

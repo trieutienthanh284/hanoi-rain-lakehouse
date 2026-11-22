@@ -1,0 +1,147 @@
+# Phase 4D — rainfall nowcast v2 candidates: "cut" (Model 1) vs "weight" (Model 2)
+# (TASK_P4D_MODEL_V2_CUT_VS_WEIGHT.md + hub decisions after P4D.0). Not a flood model; labels are IMERG (satellite
+# estimate). Evaluation design frozen 2026-11-22 before any P4D training (DECISIONS D169-D178):
+#   LOSO folds 2023 / 2024 / 2025; evaluation set = held-out season, full May-Oct, the 47 city pixels, never cut,
+#   never weighted; 2025-10 (IMERG Late labels) reported apart and never used for a choice; training rows carry
+#   IMERG Final labels only. 2025 is an evaluation fold although its test result was seen once in P4B.6 (stated
+#   limitation, D170); P4B.6 results are never a selection criterion. No 2022 rows, no substitute (hub 0-1).
+version: "v2-p4d"
+random_seed: 42
+
+frames:                       # ADD-005, unchanged from v1
+  analysis_time_step_min: 30
+  issue_offset_min: 10
+  frame_length_min: 30
+  lead_min: [0, 30, 60]
+
+targets:                      # G4 locked 2026-11-17 (user)
+  variable: rain_rate_mm_h
+  operator: ">="
+  thresholds_mm_h: [0.5, 2.5, 7.6]
+  primary_mm_h: 2.5
+  secondary_mm_h: 7.6
+  auxiliary_mm_h: 0.5
+
+scope:
+  seasons: [2023, 2024, 2025]
+  season_months: [5, 6, 7, 8, 9, 10]
+  label_source_default: imerg_final
+  label_source_by_month: {"2025-10": imerg_late}   # IMERG Final 2025-10 does not exist (REPORT_P2B §13.9)
+  training_label_source: imerg_final               # a row with any other label source is never a training row
+  day_ranges: null            # smoke only: explicit [from, to] UTC day ranges instead of the full seasons
+
+availability:                 # P4A.1, unchanged
+  gsmap_now:
+    rule: realtime_measured
+    available_after_window_end_min: 5
+  openmeteo_rule_file: configs/openmeteo_availability.yaml
+
+features:                     # v1 feature code path (src/gold/features.py), unchanged parameters
+  feature_version: v1
+  gsmap_variable_primary: rain_rate_gc_mm_h
+  gsmap_variable_raw: rain_rate_mm_h
+  history_k: [0, 1, 2, 3, 4, 5, 6]
+  wet_mm_h: 0.5
+  cap_mm_h: 200.0
+  minutes_since_wet_cap: 180
+  neighbourhood_k: [0, 2]
+  box_radii_px: [1, 2, 5]
+  ring_deg: [0.3, 1.0]
+  quadrants: [N, E, S, W]
+  motion:
+    max_shift_px_per_h: 4
+    min_corr: 0.3
+    min_wet_frac: 0.01
+    min_overlap_px: 100
+    window_centre_offset_min: -30
+    upwind_deg: [0.3, 1.0]
+    upwind_half_angle_deg: 45.0
+    extent_mm_h: [0.5, 2.5]
+  allowlist_prefixes: ["gc_", "raw_", "nb_", "ring_", "gsmap_", "cal_", "lat", "lon", "motion_", "adv_", "upwind_",
+                       "extent_", "dist_to_city_center_km", "is_city", "ring_coverage"]
+  set: d                      # feature family d of v1 (no cal_month, no NWP): F* of P4B
+  ring_model_extra: [dist_to_city_center_km, is_city, ring_coverage]   # only models trained with ring pixels
+
+pixels:
+  city: is_city_pixel         # 47 pixels (D05), read from IMERG Silver of the first build day
+  ring:                       # buffer ring around the city (D181, supersedes the 33-pixel ring of D171)
+    rule: largest_margin_min_pixels   # every domain pixel with margin to the domain edge >= min_margin_px, minus
+                               #   city; min_margin_px = the LARGEST margin giving >= min_ring_pixels (checked in code)
+    min_ring_pixels: 150       # TASK target 150-300
+    min_margin_px: 7           # margin 8 -> 121 ring pixels, 7 -> 177; the full set-d footprint needs 10 px:
+                               #   ring pixels with margin 7-9 get box / ring / upwind / advection features computed
+                               #   over the in-domain part only (ring_coverage = in-domain share of the ring)
+    expected_pixels: 177       # 16 x 14 margin box minus 47 city pixels
+    max_pixels: null           # subsample (fixed seed) only if the RAM estimate required it; city never subsampled
+    subsample_seed: 42
+  centre: mean_of_city_pixel_centres   # dist_to_city_center_km (great circle)
+
+lightgbm:                     # v1 setting g1 (REPORT_P4B §4.3) at every threshold (v1 kept g1 for 0.5 and 7.6)
+  objective: binary
+  learning_rate: 0.03
+  num_leaves: 15
+  min_data_in_leaf: 500
+  lambda_l2: 1
+  feature_fraction: 0.7
+  bagging_fraction: 0.8
+  bagging_freq: 1
+  metric: binary_logloss
+  num_threads: 4
+  verbose: -1
+
+inner_cv:                     # number of boosting rounds, inside the training seasons only
+  folds: calendar_month       # every training month is held out once (1-day buffer both sides)
+  buffer_days: 1
+  max_rounds: 3000
+  early_stopping_rounds: 150  # on the held-out month: city pixels, all its days (never cut), unweighted
+  rounds_rule: median of the inner fold optima
+
+evaluation:
+  loso_seasons: [2023, 2024, 2025]
+  eval_pixels: city
+  secondary_months: ["2025-10"]          # IMERG Late labels: reported apart, never used for a choice
+  recalibration: platt_crossfit          # Platt fitted on the inner OOF of the training seasons (city, uncut,
+                                         # unweighted), applied to the held-out season; raw and recalibrated reported
+  cut_rules: {"0.5": max_csi, "2.5": max_csi, "7.6": freq_bias_1.5}   # chosen on the recalibrated inner OOF
+  heavy_rule: nested                     # 7.6 alarm also needs the 2.5 alarm of the same model (as v1)
+  bootstrap_resamples: 1000
+  bootstrap_block: day                   # local day (Asia/Ho_Chi_Minh), as P4B
+  ci_level: 0.90
+  reliability_bins: 10
+  wettest_days: 10                       # per held-out season (2025: May-Sep), ranked by city-mean label at F0
+  half_month: utc_date                   # 1-15 / 16-end by the UTC date of t0
+  events:
+    yagi: ["2024-09-06", "2024-09-08"]   # local days, fold 2024, IMERG Final
+    matmo: ["2025-10-06", "2025-10-07"]  # local days, fold 2025, IMERG Late (secondary)
+
+model1:                       # "cut" (user decision 1, hub 5-6): training rows dropped by the UTC date of t0
+  cut_utc: [["05-01", "05-15"], ["10-16", "10-31"]]
+  chain: [m0, m1a, m1b]       # m1a = m0 data with the cut; m1b = previous kept step + ring pixels
+  keep_rule: >-
+    a step is kept only if the mean over F0/F30/F60 of the recalibrated pooled OOF log-loss at 2.5 mm/h is
+    strictly lower than that of the previous kept step (day-block bootstrap CI of the difference reported)
+
+model2:                       # "weight": final Model 1 dataset without the cut, sample weight = w_period x w_class
+  period_window_utc: ["05-16", "10-15"]   # w_period = k inside (UTC date of t0), 1 outside
+  grid: {k: [2, 3], alpha: [0, 1], beta: [0, 4]}   # w_class = 1 + alpha [label >= 2.5] + beta [label >= 7.6]
+  grid_thresholds: [2.5, 7.6]             # 7.6 CSI/POD reported per setting
+  choose: lowest mean over F0/F30/F60 of the recalibrated pooled OOF log-loss at 2.5 mm/h
+
+resources:
+  max_rss_gb: 10.0            # hosted runner ~16 GB; a unit above this fails (estimate ~5.2 GB, REPORT_P4D §2.3)
+
+r2_budget:                    # preflight gate: refuse when lake/v1/ total + projection > max_total_gb
+  max_total_gb: 6.0
+  projected_gold_gb: 1.45     # table_v2: 17,805,312 rows x ~80 B (pilot table_A: 57.7 B/row with fewer columns)
+  projected_run_gb: 0.70      # 216 OOF parquets x ~2.5 MB + base, JSON, tables
+
+smoke:                        # job p4d_smoke: one short block per season, 4 ring pixels, one weight setting, 2.5 only
+  scope:
+    day_ranges: [["2023-05-13", "2023-05-18"], ["2024-10-14", "2024-10-19"], ["2025-05-13", "2025-05-18"],
+                 ["2025-10-06", "2025-10-07"]]     # every block contains cut days; 2025-10 exercises the Late path
+  pixels: {ring: {max_pixels: 4}}
+  targets: {thresholds_mm_h: [2.5]}
+  inner_cv: {max_rounds: 300, early_stopping_rounds: 30}
+  model2: {grid: {k: [2], alpha: [1], beta: [4]}, grid_thresholds: [2.5]}
+  evaluation: {bootstrap_resamples: 200, wettest_days: 3}
+  r2_budget: {projected_gold_gb: 0.01, projected_run_gb: 0.02}
