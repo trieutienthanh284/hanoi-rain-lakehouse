@@ -851,6 +851,14 @@ def main_p4d(a, t_start: float) -> int:
     C.log("plan", job=a.job, run_id=run_id, part=f"{i}/{n}", units_total=len(units), units_in_part=len(mine),
           done=len(done), todo=[u.id for u in mine + gates if u.id not in done][:40], smoke=smoke,
           gold_id=PD.gold_id(cfg), note=PD.NOT_FLOOD)
+    icv = PD.inner_cv_plan_check(cfg)                 # fail fast: every fold / variant needs >= 2 inner blocks
+    bad = [r for r in icv if not r["ok"]]
+    C.log("inner_cv_check", ok=not bad, cases=len(icv), failing=bad[:6])
+    if bad:
+        C.log("refused", job=a.job, reason="inner CV would have < 2 usable blocks or < 2 distinct calendar months "
+                                           "for some fold / variant (see inner_cv_check); fix scope.day_ranges in "
+                                           "configs/model_v2.yaml")
+        return 2
     if a.plan:
         return 0
     ok, n0 = parts_lock(store, a.job, run_id, n)

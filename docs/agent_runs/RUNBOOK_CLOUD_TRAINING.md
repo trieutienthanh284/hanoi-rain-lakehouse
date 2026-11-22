@@ -124,14 +124,14 @@ Ghi chú: đơn vị `feat-*` của run smoke mới ghi lại các phân vùng G
 
 Một job làm trọn P4D.3 → P4D.7: Gold `table_v2` (47 pixel thành phố + 177 pixel vành đệm, lề ≥ 7 px, 2023-05 … 2025-10; D181), LOSO 3 fold, M0 → M1a → M1b, lưới Model 2 (8 thiết lập), so sánh, rồi **dừng** ở `COMPARE_DONE.json`. Không có `final`, không có `race_drill`, không đọc 2022. Thiết kế: `configs/model_v2.yaml`, REPORT_P4D §1–§2, D169–D183.
 
-Định danh (tính từ mã đã publish; đổi nếu mã đổi): `p4d` run `84679b7ec0cf`, gold `a4a6329bcf13`; `p4d_smoke` run `793004743201`, gold `68c63e533e62`.
+Định danh (tính từ mã đã publish; đổi nếu mã đổi): `p4d` run `650b5ed0d051`, gold `a4a6329bcf13`; `p4d_smoke` run `72224a82daba`, gold `0f172efca37b` (D185; lượt smoke `793004743201` hỏng, không tiếp tục).
 
 ## P4D.1 Thứ tự chạy (form: job / part / final / race_drill)
 
 | # | Form | Khi nào | Ước lượng |
 |---|---|---|---|
 | 1 | `p4d_smoke` / `1/1` / `false` / `false` | ngay sau khi push | ≈ 30 phút runner |
-| 2 | agent kiểm tra smoke (`fetch_run --job p4d_smoke --run-id 793004743201 --verify`) | sau khi 1 xanh | cục bộ, chỉ đọc |
+| 2 | agent kiểm tra smoke (`fetch_run --job p4d_smoke --run-id 72224a82daba --verify`) | sau khi 1 xanh | cục bộ, chỉ đọc |
 | 3 | `p4d` / `1/13` … `13/13` / `false` / `false` | sau khi agent báo smoke PASS; dispatch 13 phần cách nhau < 5 phút | ≈ 250 phút phần chậm nhất (≈ 2 300 phút runner tổng) |
 
 - **Giữ đúng 13 phần cho cả run.** Lần chạy đầu ghi `parts.json`; mọi lần chạy cùng run với số phần khác bị từ chối (exit 2, `refused … split into 13 parts`). Khi một phần dừng (`time_budget_reached`, `waiting_for_other_parts`, lỗi mạng), chạy lại **đúng phần đó** (`i/13`): đơn vị có marker được bỏ qua.

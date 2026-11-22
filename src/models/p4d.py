@@ -355,7 +355,7 @@ def gold_parts(ctx: Ctx) -> list[tuple[int, int, Path]]:
 def gate_g2(ctx: Ctx) -> tuple[list[str], dict]:
     from src.gold import build_table_v2 as BT2
     ctx.fetch_gold()
-    rows, nan = [], []
+    rows, nan, labs = [], [], []
     for y, m, part in gold_parts(ctx):
         df = pd.read_parquet(part)
         fcols = BT2.feature_columns(df.columns)
@@ -371,6 +371,9 @@ def gate_g2(ctx: Ctx) -> tuple[list[str], dict]:
                      "bytes": int((part).stat().st_size), "detail": "; ".join(v[:3])})
         for r in BT2.nan_share_by_group(df, fcols):
             nan.append({"partition": rows[-1]["partition"], **r})
+        c = df.loc[df["is_city"] == 1, ["season", "t0", "lead_min"] + [thr_col(t) for t in thresholds(ctx.cfg)]].copy()
+        c["train_month"] = BT2.is_training_month(ctx.cfg, y, m)
+        labs.append(c)
         del df
     r = pd.DataFrame(rows)
     nn = pd.DataFrame(nan)
@@ -398,6 +401,12 @@ def gate_g2(ctx: Ctx) -> tuple[list[str], dict]:
             tr.append({"pixels": g, "footprint": c, "n_pixels": len(sub), "mean": float(sub[c].mean()),
                        "min": float(sub[c].min()), "share_truncated": float((sub[c] < 1 - 1e-9).mean())})
     pd.DataFrame(tr).to_csv(out / "truncation_city_vs_ring.csv", index=False)
+    lab = pd.concat(labs, ignore_index=True)
+    lab["t0"] = lab["t0"].astype("datetime64[ns, UTC]")
+    icv = inner_cv_label_check(ctx.cfg, lab)
+    del lab, labs
+    pd.DataFrame(icv).to_csv(out / "inner_cv_check.csv", index=False)
+    bad_icv = [r for r in icv if not r["ok"]]
     eq = a1_equality(ctx)
     write_json(out / "a1_equality.json", eq)
     write_json(out / "pixels.json", prec)
@@ -413,8 +422,12 @@ def gate_g2(ctx: Ctx) -> tuple[list[str], dict]:
          "city_pixels": prec["city_pixels"], "gold_bytes": gold_bytes,
          "nan_share_max_city": float(a["city"].max()) if "city" in a else None,
          "nan_share_max_ring": float(a["ring"].max()) if "ring" in a else None,
-         "nan_share_rows": nrows}
+         "nan_share_rows": nrows, "inner_cv_ok": not bad_icv, "inner_cv_failing": bad_icv[:10]}
     write_json(out / "summary.json", m)
+    if bad_icv:
+        raise RuntimeError(f"G2 gate FAIL: inner CV has < 2 usable blocks (held-out month and training rows each "
+                           f"need a positive city row) for {len(bad_icv)} fold/variant/frame/threshold cases, e.g. "
+                           f"{bad_icv[:3]}; choose other days (scope.day_ranges) — no fit unit was started")
     if not (ok and ok_eq):
         raise RuntimeError(f"G2 gate FAIL: {m}")
     return [rel(p) for p in sorted(out.glob("*")) if p.is_file()], m
@@ -446,6 +459,79 @@ def a1_equality(ctx: Ctx) -> dict:
             "common_columns": len(common), "max_abs_diff": max(diffs.values(), default=0.0),
             "nan_mismatch": int(sum(nanm.values())),
             "v2_only_columns": [c for c in BT2.feature_columns(v2.columns) if c not in common]}
+
+
+# ============================================================================ inner-CV feasibility (fail fast)
+VARIANTS = {"plain": False, "cut": True}          # m0 / m1b-without-cut / m2 (no cut) and m1a / m1b-with-cut
+
+
+def _train_mask_days(days, held: tuple[int, int], buf: int, use_cut: bool, cfg: dict) -> list:
+    from datetime import date
+    y, m = held
+    a = date(y, m, 1)
+    b = date(y + (m == 12), m % 12 + 1, 1)
+    out = []
+    for d in days:
+        if (d.year, d.month) == held:
+            continue
+        if not (d <= a - timedelta(days=buf + 1) or d >= b + timedelta(days=buf)):
+            continue
+        if use_cut and cut_mask(np.array([d.month * 100 + d.day]), cfg)[0]:
+            continue
+        out.append(d)
+    return out
+
+
+def inner_cv_plan_check(cfg: dict) -> list[dict]:
+    """Structural check from the configured days only (plan time, before any unit runs): for every LOSO fold and
+    every training variant (without / with the Model 1 cut), the inner CV must have >= 2 usable blocks, a block
+    (training-season year-month) being usable when training days remain outside it (1-day buffer, cut applied),
+    and the usable blocks must span >= 2 distinct calendar months (D185: a training set of one calendar month, e.g.
+    2023-05 + 2025-05 in fold 2024 of p4d_smoke 793004743201, gives no seasonal contrast for early stopping)."""
+    from src.gold import build_table_v2 as BT2
+    days = BT2.build_days(cfg)
+    buf = int(cfg["inner_cv"]["buffer_days"])
+    rows = []
+    for s in seasons(cfg):
+        tr_days = [d for d in days if d.year != s and BT2.is_training_month(cfg, d.year, d.month)]
+        blocks = sorted({(d.year, d.month) for d in tr_days})
+        for var, use_cut in VARIANTS.items():
+            ub = [(y, m) for y, m in blocks if _train_mask_days(tr_days, (y, m), buf, use_cut, cfg)]
+            cal = sorted({m for _, m in ub})
+            rows.append({"heldout_season": s, "variant": var, "inner_blocks": [f"{y}-{m:02d}" for y, m in blocks],
+                         "usable_blocks": [f"{y}-{m:02d}" for y, m in ub], "calendar_months": cal,
+                         "ok": len(ub) >= 2 and len(cal) >= 2})
+    return rows
+
+
+def inner_cv_label_check(cfg: dict, lab: pd.DataFrame) -> list[dict]:
+    """Data check on the Gold labels (gate g2, before any fit): for every fold x variant x frame x threshold, the
+    inner CV must have >= 2 usable blocks, i.e. held-out month with a positive city row AND remaining training rows
+    (buffer, cut) with a positive city row. lab: city rows with season, t0, lead_min, train_month, y_* columns.
+    Catches dry smoke blocks (p4d_smoke 793004743201: 2023-05-13..18 has no city window >= 2.5 mm/h)."""
+    buf = pd.Timedelta(days=int(cfg["inner_cv"]["buffer_days"]))
+    t = lab["t0"].dt.tz_convert("UTC")
+    ym = (t.dt.year * 100 + t.dt.month).to_numpy()
+    md = (t.dt.month * 100 + t.dt.day).to_numpy()
+    rows = []
+    for s in seasons(cfg):
+        trainable = (lab["season"].to_numpy() != s) & lab["train_month"].to_numpy(bool)
+        for var, use_cut in VARIANTS.items():
+            keep = trainable & (~cut_mask(md, cfg) if use_cut else True)
+            for L in leads(cfg):
+                lm = lab["lead_min"].to_numpy() == L
+                for thr in thresholds(cfg):
+                    y = lab[thr_col(thr)].to_numpy() > 0
+                    usable = []
+                    for mo in sorted(set(ym[trainable & lm].tolist())):
+                        a, b = _month_bounds(mo)
+                        ho = trainable & lm & (ym == mo)
+                        tr = keep & lm & (ym != mo) & ((t < a - buf) | (t >= b + buf)).to_numpy()
+                        if y[ho].any() and y[tr].any():
+                            usable.append(int(mo))
+                    rows.append({"heldout_season": s, "variant": var, "lead_min": L, "threshold": thr,
+                                 "usable_blocks": usable, "ok": len(usable) >= 2})
+    return rows
 
 
 # ============================================================================ data access

@@ -24,7 +24,8 @@ CITY = np.sort(BOX[:47])
 
 def _cfg():
     c = copy.deepcopy(PD.load_cfg(smoke=True))
-    c["scope"]["day_ranges"] = [["2023-05-14", "2023-05-15"], ["2025-10-06", "2025-10-06"]]
+    c["scope"]["day_ranges"] = [["2023-05-15", "2023-05-16"], ["2024-10-15", "2024-10-16"],
+                                ["2025-07-01", "2025-07-01"], ["2025-10-06", "2025-10-06"]]
     return c
 
 
@@ -54,7 +55,7 @@ def ws(tmp_path, monkeypatch):
     monkeypatch.setattr(P, "SILVER", work / "data/silver/met")
     rng = np.random.default_rng(5)
     city = np.isin(PIX_ALL, CITY)
-    for d in _days("2023-05-13", 3) + _days("2025-10-05", 2):
+    for d in _days("2023-05-14", 3) + _days("2024-10-14", 3) + _days("2025-06-30", 2) + _days("2025-10-05", 2):
         rows = []
         for k in range(48):
             we = pd.Timestamp(d, tz="UTC") + pd.Timedelta(minutes=30 * k)
@@ -62,7 +63,8 @@ def ws(tmp_path, monkeypatch):
             rows.append(pd.DataFrame({"pixel_id": PIX_ALL, "window_end_utc": we, "rain_rate_mm_h": f * 1.1,
                                       "rain_rate_gc_mm_h": f, "is_city_pixel": city}))
         _put(store, f"data/silver/met/gsmap_now/date={d}/part.parquet", pd.concat(rows, ignore_index=True))
-    for src, days in (("imerg_final", _days("2023-05-14", 3)), ("imerg_late", _days("2025-10-06", 2))):
+    for src, days in (("imerg_final", _days("2023-05-15", 3) + _days("2024-10-15", 3) + _days("2025-07-01", 2)),
+                      ("imerg_late", _days("2025-10-06", 2))):
         for d in days:
             t = pd.date_range(pd.Timestamp(d, tz="UTC"), periods=48, freq="30min")
             _put(store, f"data/silver/met/{src}/date={d}/part.parquet",
@@ -91,7 +93,7 @@ def test_preflight_and_budget(ws):
     ctx, _ = ws
     rels, m = PD.gate_preflight(ctx)
     rec = json.loads((PB.ROOT / rels[0]).read_text(encoding="utf-8"))
-    assert m["ok"] and rec["required_margin_px"] == 10 and rec["ok_geometry"] and rec["days"] == 3
+    assert m["ok"] and rec["required_margin_px"] == 10 and rec["ok_geometry"] and rec["days"] == 6
     assert rec["ring"]["min_margin_px"] == 7 and rec["ring"]["ring_candidates"] == 177 and m["ring_pixels"] == 4
     ctx.cfg["r2_budget"]["max_total_gb"] = 0.0
     with pytest.raises(RuntimeError, match="preflight FAIL"):
@@ -101,12 +103,12 @@ def test_preflight_and_budget(ws):
 def test_feat_units_and_g2_gate(ws):
     ctx, store = ws
     res = _feat_all(ctx)
-    assert list(res) == ["feat-2023-05", "feat-2025-10"]
+    assert list(res) == ["feat-2023-05", "feat-2024-10", "feat-2025-07", "feat-2025-10"]
     npx = 47 + 4
     assert res["feat-2023-05"]["rows"] == 2 * 48 * 3 * npx and res["feat-2023-05"]["rows_ring"] == 2 * 48 * 3 * 4
     assert res["feat-2025-10"]["label_source"] == "imerg_late"
     keys = ctx.store.list(PD.GOLD_REMOTE)
-    assert len(keys) == 4 and all(f"/table_v2/gid={ctx.gid}/" in k for k in keys)
+    assert len(keys) == 8 and all(f"/table_v2/gid={ctx.gid}/" in k for k in keys)
     a = pd.read_parquet(ctx.gold_local() / "season=2023/month=05/part.parquet")
     assert {"dist_to_city_center_km", "is_city", "ring_coverage", "cal_month"} <= set(a.columns)
     assert not any(c.startswith("cal_doy") for c in a.columns)
@@ -153,3 +155,22 @@ def test_feat_refuses_leaky_feature(ws, monkeypatch):
     with pytest.raises(RuntimeError, match="G2 violations"):
         PD.run_feat(u, ctx)
     assert not ctx.store.list(PD.GOLD_REMOTE)
+
+
+def test_g2_stops_on_dry_inner_block(ws, monkeypatch):
+    """A training block without any city row >= 2.5 mm/h (the first p4d_smoke failure) stops g2 before any fit."""
+    ctx, store = ws
+    _feat_all(ctx)
+    _reference_a1(ctx, store)
+    p = ctx.gold_local() / "season=2025/month=07/part.parquet"
+    df = pd.read_parquet(p)
+    for c in ("y_0p5", "y_2p5", "y_7p6"):
+        if c in df:
+            df[c] = np.int8(0)
+    df.to_parquet(p, index=False)                    # local copy only: g2 re-reads it (fetch skips same size)
+    monkeypatch.setattr(PD.Ctx, "fetch_gold", lambda self: 0)
+    with pytest.raises(RuntimeError, match="inner CV has < 2 usable blocks"):
+        PD.gate_g2(ctx)
+    chk = pd.read_csv(PB.ROOT / "reports/p4d/g2/inner_cv_check.csv")
+    assert not chk.loc[chk["heldout_season"].isin([2023, 2024]), "ok"].any()
+    assert chk.loc[chk["heldout_season"] == 2025, "ok"].all()

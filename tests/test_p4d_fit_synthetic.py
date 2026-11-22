@@ -27,7 +27,7 @@ def _cfg():
     c = copy.deepcopy(PD.load_cfg(smoke=True))
     c["scope"]["day_ranges"] = [["2023-05-14", "2023-05-17"], ["2024-09-06", "2024-09-08"],
                                 ["2024-10-15", "2024-10-17"], ["2025-05-14", "2025-05-17"],
-                                ["2025-10-06", "2025-10-07"]]
+                                ["2025-07-14", "2025-07-16"], ["2025-10-06", "2025-10-07"]]   # D185: >= 2 calendar months per LOSO training set
     c["targets"]["thresholds_mm_h"] = [0.5, 2.5, 7.6]
     c["model2"] = {**c["model2"], "grid": {"k": [2], "alpha": [0, 1], "beta": [4]}, "grid_thresholds": [2.5, 7.6]}
     c["lightgbm"] |= {"num_threads": 2, "min_data_in_leaf": 50}
@@ -129,7 +129,7 @@ def test_end_to_end(run, tmp_path, capsys):
     # fit records: Platt + inner cut, training rows Final only, never 2025-10, cut honoured
     f = json.loads(_r("reports/p4d/fit/fit-m1a-s2024-lead0-thr2p5.json").read_text(encoding="utf-8"))
     assert f["platt"]["method"] == "platt" and f["cut"]["rule"] == "max_csi" and f["dataset"]["cut"]
-    assert [x["month"] for x in f["inner_folds"]] == [202305, 202505]
+    assert [x["month"] for x in f["inner_folds"]] == [202305, 202505, 202507]
     f0 = json.loads(_r("reports/p4d/fit/fit-m0-s2024-lead0-thr2p5.json").read_text(encoding="utf-8"))
     assert f["train_rows"] < f0["train_rows"] and f0["train_rows_ring"] == 0
     h = json.loads(_r("reports/p4d/fit/fit-m0-s2025-lead0-thr7p6.json").read_text(encoding="utf-8"))

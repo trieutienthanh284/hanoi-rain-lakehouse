@@ -105,7 +105,7 @@ def test_smoke_units_and_ids(monkeypatch):
     fits = [u for u in us if u.kind == "fit"]
     assert {u.params["thr"] for u in fits} == {2.5}
     assert sorted({u.params["spec"] for u in fits}) == ["m0", "m1a", "m1b", "m2-g1"]
-    assert [u.id for u in us if u.kind == "feat"] == ["feat-2023-05", "feat-2024-10", "feat-2025-05", "feat-2025-10"]
+    assert [u.id for u in us if u.kind == "feat"] == ["feat-2023-05", "feat-2024-10", "feat-2025-07", "feat-2025-10"]
     assert PD.gold_id(SMOKE) != PD.gold_id(CFG)
     assert CT.run_id_for("p4d") != CT.run_id_for("p4d_smoke")
     assert CT.run_id_for("p4d") not in (CT.run_id_for("p4b"), CT.run_id_for("p4b_smoke"))
@@ -274,3 +274,71 @@ def test_workflow_lists_p4d():
     wf = (PD.CODE_ROOT / ".github" / "workflows" / "train.yml").read_text(encoding="utf-8")
     assert "p4d_smoke, p4d]" in wf and "--wait-minutes 150" in wf
     assert "tests/test_p4d_job.py" in wf and "inputs.job == 'p4d'" in wf
+
+
+# ---------------------------------------------------------------- inner-CV feasibility (fail fast)
+OLD_SMOKE = [["2023-05-13", "2023-05-18"], ["2024-10-14", "2024-10-19"], ["2025-05-13", "2025-05-18"],
+             ["2025-10-06", "2025-10-07"]]                                    # p4d_smoke 793004743201
+
+
+def _with_days(ranges):
+    c = json.loads(json.dumps(SMOKE))
+    c["scope"]["day_ranges"] = ranges
+    return c
+
+
+def test_inner_cv_plan_check_configs():
+    assert all(r["ok"] for r in PD.inner_cv_plan_check(CFG))
+    sm = PD.inner_cv_plan_check(SMOKE)
+    assert all(r["ok"] and len(r["usable_blocks"]) == 2 for r in sm) and len(sm) == 6
+    assert SMOKE["scope"]["day_ranges"][2] == ["2025-07-01", "2025-07-06"]
+    full = {(r["heldout_season"], r["variant"]): r for r in PD.inner_cv_plan_check(CFG)}
+    assert len(full[(2023, "cut")]["usable_blocks"]) == 11 and len(full[(2025, "plain")]["usable_blocks"]) == 12
+
+
+def test_inner_cv_plan_check_failures():
+    # old smoke set: fold 2024 trains on 2023-05 + 2025-05 = 2 year-month blocks but one calendar month -> refused
+    old = {(r["heldout_season"], r["variant"]): r for r in PD.inner_cv_plan_check(_with_days(OLD_SMOKE))}
+    assert not old[(2024, "plain")]["ok"] and not old[(2024, "cut")]["ok"]
+    assert old[(2024, "plain")]["usable_blocks"] == ["2023-05", "2025-05"] and old[(2024, "plain")]["calendar_months"] == [5]
+    assert all(old[(s, v)]["ok"] for s in (2023, 2025) for v in ("plain", "cut"))     # May + October
+    one = PD.inner_cv_plan_check(_with_days([["2023-05-20", "2023-05-22"], ["2024-07-20", "2024-07-22"]]))
+    bad = {(r["heldout_season"], r["variant"]) for r in one if not r["ok"]}
+    assert {(2023, "plain"), (2024, "plain")} <= bad and (2025, "plain") not in bad   # 1 block vs 2 blocks
+    same = PD.inner_cv_plan_check(_with_days([["2023-05-20", "2023-05-22"], ["2024-05-20", "2024-05-22"]]))
+    assert not {(r["heldout_season"], r["variant"]): r["ok"] for r in same}[(2025, "plain")]  # 2 blocks, 1 month
+    allcut = PD.inner_cv_plan_check(_with_days([["2023-05-01", "2023-05-05"], ["2024-10-20", "2024-10-25"],
+                                                ["2025-07-01", "2025-07-02"]]))
+    st = {(r["heldout_season"], r["variant"]): r["ok"] for r in allcut}
+    assert st[(2025, "plain")] and not st[(2025, "cut")]                      # 2023-05 / 2024-10 rows all cut
+
+
+def _labels(ranges, dry_month=None, thrs=(2.5,)):
+    rows = []
+    for a, b in ranges:
+        for d in pd.date_range(a, b, freq="D", tz="UTC"):
+            t0 = pd.date_range(d, periods=48, freq="30min")
+            y = np.zeros(48, "int8") if (d.year * 100 + d.month) == dry_month else (np.arange(48) % 5 == 0).astype("int8")
+            for L in (0, 30, 60):
+                rows.append(pd.DataFrame({"season": d.year, "t0": t0, "lead_min": L, "y_2p5": y,
+                                          "train_month": not (d.year == 2025 and d.month == 10)}))
+    return pd.concat(rows, ignore_index=True)
+
+
+def test_inner_cv_label_check_catches_old_dry_block():
+    c = _with_days(OLD_SMOKE)
+    lab = _labels(OLD_SMOKE, dry_month=202305)      # 2023-05-13..18: no city window >= 2.5 mm/h (P2B events)
+    r = PD.inner_cv_label_check(c, lab)
+    bad = {(x["heldout_season"], x["variant"]) for x in r if not x["ok"]}
+    assert (2024, "plain") in bad and (2024, "cut") in bad                     # the failing fit-m0-s2024-...
+    new = SMOKE["scope"]["day_ranges"]
+    assert all(x["ok"] for x in PD.inner_cv_label_check(SMOKE, _labels(new)))
+
+
+@pytest.mark.parametrize("ranges", [OLD_SMOKE, [["2023-05-20", "2023-05-22"], ["2024-05-20", "2024-05-22"]]])
+def test_main_refuses_infeasible_days(tmp_path, monkeypatch, ranges):
+    bad = _with_days(ranges)
+    monkeypatch.setattr(PD, "load_cfg", lambda smoke=False, path=None: json.loads(json.dumps(bad)))
+    assert C.cli(CT.main, ["--job", "p4d_smoke", "--store", f"local:{tmp_path / 's'}", "--run-id", "x",
+                           "--plan"]) == 2
+    assert not (tmp_path / "s").exists() or not any((tmp_path / "s").rglob("parts.json"))

@@ -137,8 +137,11 @@ r2_budget:                    # preflight gate: refuse when lake/v1/ total + pro
 
 smoke:                        # job p4d_smoke: one short block per season, 4 ring pixels, one weight setting, 2.5 only
   scope:
-    day_ranges: [["2023-05-13", "2023-05-18"], ["2024-10-14", "2024-10-19"], ["2025-05-13", "2025-05-18"],
-                 ["2025-10-06", "2025-10-07"]]     # every block contains cut days; 2025-10 exercises the Late path
+    # D184: every LOSO training set has 2 year-month blocks, each with city rows >= 2.5 mm/h in its uncut days and
+    # (2023-05, 2024-10) in its cut days (reports/p2b/events/rain_events.csv). The first smoke (run 793004743201)
+    # used 2023-05-13..18, which has no city window >= 2.5 mm/h -> "no usable inner fold" in fold 2024.
+    day_ranges: [["2023-05-10", "2023-05-20"], ["2024-10-14", "2024-10-19"], ["2025-07-01", "2025-07-06"],
+                 ["2025-10-06", "2025-10-07"]]     # 2025-10: IMERG Late, separate evaluation only (Matmo)
   pixels: {ring: {max_pixels: 4}}
   targets: {thresholds_mm_h: [2.5]}
   inner_cv: {max_rounds: 300, early_stopping_rounds: 30}
