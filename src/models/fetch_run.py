@@ -13,6 +13,7 @@
 * --verify (after the fetch, read only): every output listed in every marker must exist in the mirror with the
   marker's sha256, no mirrored file may be unlisted, and summary.json / done.json are reported; exit 1 otherwise
   (race-fix check, REPORT_P4B §3.5).
+* p4e jobs (D196): the cloud figures (files/reports/p4e/figs/) are also copied to reports/p4e/figs/<job>_<run_id>/.
 """
 from __future__ import annotations
 
@@ -114,6 +115,29 @@ def verify(mirror: Path, job: str, run_id: str) -> dict:
     return out
 
 
+def copy_figs(dest: Path, job: str, run_id: str) -> list[str]:
+    """p4e (D196): copy the cloud figures of the mirror (files/reports/p4e/figs/) to reports/p4e/figs/<job>_<run_id>/
+    (new folder per run; an existing file with other bytes is never overwritten: error)."""
+    src = dest / "reports" / job / "cloud" / run_id / "files" / "reports" / "p4e" / "figs"
+    out = dest / "reports" / "p4e" / "figs" / f"{job}_{run_id}"
+    done = []
+    if not src.is_dir():
+        return done
+    for f in sorted(src.iterdir()):
+        if not f.is_file():
+            continue
+        t = out / f.name
+        b = f.read_bytes()
+        if t.is_file():
+            if t.read_bytes() != b:
+                raise RuntimeError(f"{t} exists with other bytes; not overwritten")
+        else:
+            out.mkdir(parents=True, exist_ok=True)
+            t.write_bytes(b)
+        done.append(t.relative_to(dest).as_posix())
+    return done
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--job", required=True, choices=CT.JOBS)
@@ -127,6 +151,9 @@ def main(argv=None) -> int:
     log = fetch(store, a.job, run_id, Path(a.dest_root) if a.dest_root else ROOT)
     C.log("fetched", job=a.job, run_id=run_id, objects=log["objects"], bytes=log["bytes"],
           installed=len(log["installed"]), identical=log["identical"], archived=len(log["archived"]))
+    if a.job.startswith("p4e"):
+        figs = copy_figs(Path(a.dest_root) if a.dest_root else ROOT, a.job, run_id)
+        C.log("figs_copied", job=a.job, run_id=run_id, files=len(figs))
     if a.verify:
         dest = Path(a.dest_root) if a.dest_root else ROOT
         v = verify(dest / "reports" / a.job / "cloud" / run_id, a.job, run_id)

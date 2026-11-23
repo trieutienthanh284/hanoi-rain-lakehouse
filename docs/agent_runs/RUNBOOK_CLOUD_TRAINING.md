@@ -172,3 +172,20 @@ Trên R2, job chỉ ghi được `lake/v1/runs/<job>/` và `lake/v1/gold/met_tra
 6. Dòng `end`: `"lost": 0, "output_mismatch": 0`; ở phần thắng `compare-done`: `"compare_complete": true`. Nếu `cmp` lỗi với `rounds check FAIL` (luật pre-registered D189): **dừng**, báo agent, không chạy lại.
 
 Trên R2, job chỉ ghi được `lake/v1/runs/p4e_smoke/` và `lake/v1/gold/met_training/table_v2*/` (khóa khác: `KeyRefused`).
+
+### P4E.3 Smoke lần 2 sau D196 (run `048a2def9cf8`, gold smoke `f889057f41ac` dùng lại)
+
+Cùng ngày, cùng form như P4E.1 (2 phần, `race_drill = true`), run id mới vì mã đổi:
+
+| # | Form | Ước lượng (mô hình D191, hằng số cỡ đầy đủ) |
+|---|---|---|
+| 1 | `p4e_smoke` / `1/2` / `false` / `true` | ≈ 45 phút (thực tế smoke trước ≈ 3–4 phút) |
+| 2 | `p4e_smoke` / `2/2` / `false` / `true`, dispatch ngay sau 1 | ≈ 18 phút; tổng ≈ 62 phút runner |
+| 3 | (agent) `python -m src.models.fetch_run --job p4e_smoke --run-id 048a2def9cf8 --verify` | cục bộ, chỉ đọc; hình được chép vào `reports/p4e/figs/p4e_smoke_048a2def9cf8/` |
+
+Dòng log thêm so với P4E.2:
+- `dry-full-2024-07` (đơn vị D196): đọc **chỉ đọc** một tháng Gold đầy đủ `gid=a4a6329bcf13/season=2024/month=07/part.parquet`, `unit_done … "dry_scene_share": [x, x, x]` (F0/F30/F60).
+- `fit-m1ds10-…`: `rows_saved` > 0 (định nghĩa cảnh khô D196).
+- `figs` (gate kết, sau `cmp`): `"png": n` (≥ 6), `replay_ok`, `replay_skipped` (Yagi / Matmo không nằm trong fold smoke → bỏ qua, có ghi lý do).
+- Gate kết nay là `cmp` → `figs` → `compare-done`.
+

@@ -30,12 +30,20 @@ downsampling:                 # P4E.1 (inputs only, never labels)
   seed: "p4e-dry-scene-v1"    # keep a dry scene iff sha256(seed | t0 UTC ISO) / 2^256 < p (all pixels of t0 together)
   weight: inverse_p           # kept dry rows get weight 1/p, all other rows 1
   applies_to: training_rows   # inner-CV training rows and the refit rows; held-out months / evaluation never touched
-  # dry scene = every row of time t0 in the loaded frame (city + ring pixels) has EXACTLY 0 in every rain-valued
-  # input column below (box / ring / upwind / extent features cover the feature neighbourhood out to the domain);
-  # NaN counts as "not dry" (missing input is never treated as zero rain). Set B adds NWP precipitation columns.
+  # dry scene = every row of time t0 in the loaded frame (city + ring pixels) is dry-compatible (D196, user
+  # 2026-11-23 after smoke d62d80e2f956): every RAW rain input window (columns below that are not motion-derived:
+  # gc / raw / box / ring / extent, + NWP precipitation in set B) is non-NaN and EXACTLY 0; the motion-derived
+  # columns (motion_columns_regex: adv_*, upwind_*) are 0 or NaN (motion is undefined when nothing rains), and NaN
+  # there is accepted ONLY because all raw windows of that row are non-NaN zeros. NaN in any raw rain column keeps
+  # the scene "not dry" (missing data is never dropped). Inputs only, never labels.
   dry_columns_regex: ['^gc_k\d$', '^raw_k\d$', '^gc_max_k06$', '^gc_mean_k06$', '^nb_r\d+_(mean|max|wet)_k\d$',
                       '^ring_[NESW]_(mean|wet)_k\d$', '^adv_(rate|max_r1)_F\d+$', '^upwind_(mean|wet)$',
                       '^extent_wet', '^nwp_.*(precip|rain).*']
+  motion_columns_regex: ['^adv_', '^upwind_']
+  full_month_check:           # D196: dry-scene share on one full month of the full Gold, measured on the cloud
+    gold_id: a4a6329bcf13     #   (smoke unit dry-full-2024-07; a full month does not fit 0.4 GB RSS locally)
+    season: 2024              #   month fixed before any measurement (mid-season, not chosen on results)
+    month: 7
   equivalence:                # PRE-REGISTERED (D189), downsampled Model 1 (set A) minus full-data Model 1,
                               #   LOSO 2023/2024/2025, pooled OOF on the evaluation set, recalibrated (Platt)
     logloss_2p5_ci90_within: [-0.0005, 0.0005]    # every frame: the whole 90 % CI inside the interval
@@ -47,8 +55,8 @@ downsampling:                 # P4E.1 (inputs only, never labels)
 
 diagnostics:                  # P4E.2: diagnosis only (events are never a selection criterion, hub 6)
   w_out_ring_weight: 0.5
-  r_near_margin_px: 3         # TASK text "smaller ring, margin 3": NEEDS_REVIEW before P4E.2 (margin 3 = 481 pixels,
-                              #   a LARGER ring than margin 7 = 177); see REPORT_P4E §0.6
+  r_near_chebyshev_max: 2     # D194: R-near = subset of the 177-pixel ring (domain-edge margin 7 unchanged) with
+                              #   Chebyshev distance to the nearest city pixel <= 2 cells = 90 pixels (measured)
   propose_rule:               # PRE-REGISTERED (D189): a variant is proposed to the hub only if it beats Model 1 on
     metric: logloss_cal_2p5   #   pooled OOF log-loss(2.5) (day-summed over F0/F30/F60, as sel-m1a/m1b of P4D)
     ci90_upper_below: 0.0     #   with the upper 90 % CI bound of (variant - Model 1) < 0

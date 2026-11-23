@@ -63,13 +63,15 @@ def test_prereg_guard(tmp_path):
 def test_smoke_units_and_plan_check():
     us = PE.units(SMOKE)
     ids = [u.id for u in us]
-    assert ids[0] == "preflight" and ids[-2:] == ["cmp", "compare-done"]
+    assert ids[0] == "preflight" and ids[-3:] == ["cmp", "figs", "compare-done"]
+    dry = [u for u in us if u.kind == "dry"]
+    assert [u.id for u in dry] == ["dry-full-2024-07"] and dry[0].deps == ("preflight",)
     fits = [u for u in us if u.kind == "fit"]
     assert {(u.params["spec"], u.params["thr"]) for u in fits} == {("m0", 2.5), ("m0", 7.6), ("m1", 2.5), ("m1", 7.6),
                                                                    ("m1ds10", 2.5), ("m1ts", 7.6)}
     assert all(u.params["season"] == 2024 and u.params["lead"] == 0 for u in fits)
     cmp = {u.id: u for u in us}["cmp"]
-    assert set(cmp.deps) == {u.id for u in us if u.kind in ("fit", "base")}
+    assert set(cmp.deps) == {u.id for u in us if u.kind in ("fit", "base", "dry")}
     icv = PE.inner_cv_plan_check(SMOKE)
     assert len(icv) == 1 and icv[0]["ok"] and icv[0]["variant"] == "plain"
     assert PD.VARIANTS == {"plain": False, "cut": True} and PD.OUT == "reports/p4d"    # env restored
@@ -115,6 +117,63 @@ def test_dry_scene_uses_inputs_only_and_whole_scenes():
     X3 = X.copy()
     X3[first, 0] = np.nan                                          # missing input is never "dry"
     assert not PE.dry_scene_rows(meta, X3, feats, CFG)[first]
+
+
+# D196 (user, 2026-11-23): NaN in motion-derived columns (adv_*, upwind_*) is dry-compatible ONLY when every raw rain
+# input window of the row is non-NaN and exactly 0; NaN in any raw rain column keeps the scene "not dry".
+MOTION = 5                                                         # feats[5] == "upwind_mean"
+RAW = 2                                                            # feats[2] == "raw_k0"
+
+
+def test_d196_motion_columns():
+    _, _, feats, _ = _frame()
+    assert PE.motion_columns(PE.rain_columns(feats, CFG), CFG) == ["upwind_mean"]
+
+
+def test_d196_dry_scene_with_nan_motion_is_dropped():
+    meta, X, feats, dry_t = _frame(T=400)
+    rows = meta["t0"].isin(dry_t).to_numpy()
+    X[rows, MOTION] = np.nan                                       # motion undefined when nothing rains
+    drop, w, dry, st = PE.downsample(meta, X, feats, CFG, 0.1)
+    assert set(meta.loc[dry, "t0"]) == dry_t                       # still dry scenes
+    u = PE.keep_draw(meta["t0"], str(CFG["downsampling"]["seed"]))
+    gone = rows & (u >= 0.1)
+    assert gone.any() and drop[gone].all() and not drop[~rows].any()
+    r, s = PE.dry_rows(X, feats, CFG)
+    assert s["rows_dry_with_motion_nan"] == int(rows.sum()) and s["motion_columns"] == 1
+
+
+def test_d196_one_nan_raw_value_keeps_scene():
+    meta, X, feats, dry_t = _frame(T=400)
+    rows = meta["t0"].isin(dry_t).to_numpy()
+    X[rows, MOTION] = np.nan
+    t = sorted(dry_t)[0]
+    sc = (meta["t0"] == t).to_numpy()
+    X[np.flatnonzero(sc)[0], RAW] = np.nan                         # one missing raw rain value in the scene
+    drop, w, dry, _ = PE.downsample(meta, X, feats, CFG, 0.1)
+    assert not dry[sc].any() and not drop[sc].any() and np.allclose(w[sc], 1.0)
+    assert set(meta.loc[dry, "t0"]) == dry_t - {t}                 # other dry scenes unaffected
+
+
+def test_d196_wet_scene_is_kept():
+    meta, X, feats, dry_t = _frame(T=400)
+    wet = (~meta["t0"].isin(dry_t)).to_numpy()
+    X[wet, MOTION] = np.nan                                        # NaN motion does not make a wet scene dry
+    drop, w, dry, _ = PE.downsample(meta, X, feats, CFG, 0.1)
+    assert not dry[wet].any() and not drop[wet].any() and np.allclose(w[wet], 1.0)
+    X2 = X.copy()                                                  # raw windows all 0 but motion > 0: not dry
+    t = sorted(dry_t)[0]
+    sc = (meta["t0"] == t).to_numpy()
+    X2[np.flatnonzero(sc)[0], MOTION] = 0.3
+    assert not PE.dry_scene_rows(meta, X2, feats, CFG)[sc].any()
+
+
+def test_d196_dry_share_stats():
+    meta, X, feats, dry_t = _frame(T=30, dry_every=3)
+    st = PE.dry_share_stats(meta, X, feats, CFG)
+    assert st["scenes"] == 30 and st["dry_scenes"] == len(dry_t) == 10
+    assert st["dry_scene_share"] == pytest.approx(1 / 3) and st["dry_scene_row_share"] == pytest.approx(1 / 3)
+    assert st["raw_columns"] == 5 and st["rows_dry"] == st["rows_raw_all_zero"] == 10 * 9
 
 
 def test_downsample_keeps_whole_scenes_with_inverse_weight():

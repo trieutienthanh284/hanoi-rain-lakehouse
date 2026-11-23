@@ -17,9 +17,11 @@ Smoke units (fold 2024, F0, 2.5 and 7.6 mm/h, P4D smoke days):
     fit-m0 / fit-m1      M0 (47 city pixels) and Model 1 (+ ring) at 2.5 and 7.6
     fit-m1ds10           Model 1 with dry scenes downsampled (p = 0.1, weight 1/p), 2.5
     fit-m1ts             Model 1 two-stage 7.6: P(R) x P(>=7.6 | R), R = label >= 0.5 at the pixel or a neighbour
+    dry-full-2024-07     D196: dry-scene share on one full month of the full Gold (read only, streamed per frame)
   4 cmp                  gate: metrics, bootstrap differences, rounds check, equivalence (informative in the smoke),
-                         two-stage violation rate, dry-scene share, cost actual vs predicted
-  5 compare-done         gate: compare_summary.json; its winner writes summary.json and COMPARE_DONE.json
+                         two-stage violation rate, dry-scene share, cost actual vs predicted (> 1.5x flagged, D196)
+  5 figs                 gate: P4E.6 figures (src/models/p4e_figs.py), PNG + CSV under reports/p4e/figs/ (D196)
+  6 compare-done         gate: compare_summary.json; its winner writes summary.json and COMPARE_DONE.json
 """
 from __future__ import annotations
 
@@ -44,7 +46,7 @@ GOLD_REMOTE = PD.GOLD_REMOTE                                     # lake/v1/gold/
 GOLD_REMOTE_PREFIX = LAKE + "gold/met_training/table_v2"         # store restriction: table_v2*/ (CLAUDE.md §8)
 OUT = "reports/p4e"
 NOT_FLOOD = PD.NOT_FLOOD
-CODE_FILES = PD.CODE_FILES + ["src/models/p4e.py", "configs/model_p4e.yaml"]
+CODE_FILES = PD.CODE_FILES + ["src/models/p4e.py", "src/models/p4e_figs.py", "configs/model_p4e.yaml"]
 # D189: sha256 of the pre-registered sections (JSON, sort_keys) written to DECISIONS before any P4E training code
 PREREG_SHA = "58eb5a7ee66974f209a9ad0e361fbd9543bce46da79db48a7646fef6e47022b2"
 PREREG_SECTIONS = {"rounds_check": ("rounds_check",), "equivalence": ("downsampling", "equivalence"),
@@ -59,6 +61,9 @@ ROUNDS_PRIOR_LR003 = {("city", 0.5): (227, 177), ("city", 2.5): (216, 161), ("ci
 INNER_ROWS_SHARE = 0.907         # mean inner-fold training rows / fit training rows (P4D)
 DRY_SHARE_PRIOR = 0.30           # planning only; measured by the smoke and P4E.1 (dry rows / training rows)
 RAIN_SCENE_SHARE_PRIOR = 0.35    # planning only; rows in R (label >= 0.5 at the pixel or a neighbour)
+# display-only minutes of units added after the pre-registration (D196; planning.gate_minutes is pre-registered)
+EXTRA_UNIT_MINUTES = {"dry": 3.0, "figs": 5.0}
+COST_RATIO_STOP = 1.5            # D196: actual / planned minutes of any unit outside [1/1.5, 1.5] -> stop and report
 
 
 def root() -> Path:
@@ -158,9 +163,11 @@ def units(cfg: dict) -> list:
             for spec, t in smoke_fit_specs(cfg):
                 work.append(U(fit_id(spec, s, L, t), "fit", 3, ("g2",), {"spec": spec, "season": s, "lead": L,
                                                                            "thr": t}))
-    u += work
-    u.append(U("cmp", "gate", 4, tuple(x.id for x in work)))
-    u.append(U("compare-done", "gate", 5, ("cmp",)))
+    dry = U(dry_full_id(cfg), "dry", 3, ("preflight",))
+    u += work + [dry]
+    u.append(U("cmp", "gate", 4, tuple(x.id for x in work) + (dry.id,)))
+    u.append(U("figs", "gate", 5, ("cmp",)))
+    u.append(U("compare-done", "gate", 6, ("figs",)))
     return u
 
 
@@ -206,20 +213,57 @@ def rain_columns(feats: list[str], cfg: dict) -> list[str]:
     return [c for c in feats if any(p.search(c) for p in pats)]
 
 
-def dry_scene_rows(meta: pd.DataFrame, X: np.ndarray, feats: list[str], cfg: dict) -> np.ndarray:
-    """True for every row whose time t0 is a dry scene: all rows of t0 in the loaded frame (city + ring pixels) have
-    exactly 0 in every rain-valued input column (NaN = not dry). Inputs only; labels are never read."""
+def motion_columns(cols: list[str], cfg: dict) -> list[str]:
+    pats = [re.compile(p) for p in cfg["downsampling"].get("motion_columns_regex", [])]
+    return [c for c in cols if any(p.search(c) for p in pats)]
+
+
+def dry_rows(X: np.ndarray, feats: list[str], cfg: dict) -> tuple[np.ndarray, dict]:
+    """Row-level dry-compatibility (D196): every RAW rain input window (rain-valued column that is not
+    motion-derived) is non-NaN and exactly 0, and every motion-derived column (adv_*, upwind_*) is 0 or NaN. NaN in a
+    motion column is accepted only through the first condition (all raw windows of the row are non-NaN zeros); NaN in
+    any raw rain column makes the row not dry. Inputs only; labels are never read. Also returns row counts that
+    explain the result (raw all zero, motion NaN among those)."""
     cols = rain_columns(feats, cfg)
-    if not cols:
-        raise RuntimeError("no rain-valued input column matched downsampling.dry_columns_regex")
-    idx = [feats.index(c) for c in cols]
-    row_dry = np.ones(len(meta), bool)
-    for i in idx:                                      # column by column: no copy of the feature matrix (RAM)
-        row_dry &= X[:, i] == 0                        # NaN == 0 is False
+    mot = motion_columns(cols, cfg)
+    raw = [c for c in cols if c not in mot]
+    if not raw:
+        raise RuntimeError("no raw rain input column matched downsampling.dry_columns_regex")
+    raw_zero = np.ones(len(X), bool)
+    for c in raw:                                      # column by column: no copy of the feature matrix (RAM)
+        raw_zero &= X[:, feats.index(c)] == 0          # NaN == 0 is False: missing raw input is never dry
+    mot_ok = np.ones(len(X), bool)
+    mot_nan = np.zeros(len(X), bool)
+    for c in mot:
+        v = X[:, feats.index(c)]
+        nan = np.isnan(v)
+        mot_ok &= (v == 0) | nan
+        mot_nan |= nan
+    row = raw_zero & mot_ok
+    return row, {"raw_columns": len(raw), "motion_columns": len(mot), "rows": int(len(X)),
+                 "rows_raw_all_zero": int(raw_zero.sum()), "rows_dry": int(row.sum()),
+                 "rows_dry_with_motion_nan": int((row & mot_nan).sum())}
+
+
+def dry_scene_rows(meta: pd.DataFrame, X: np.ndarray, feats: list[str], cfg: dict) -> np.ndarray:
+    """True for every row whose time t0 is a dry scene: all rows of t0 in the loaded frame (city + ring pixels) are
+    dry-compatible (dry_rows, D196). Inputs only; labels are never read."""
+    row_dry, _ = dry_rows(X, feats, cfg)
     codes, uniq = pd.factorize(meta["t0"])
     scene = np.ones(len(uniq), bool)
     np.logical_and.at(scene, codes, row_dry)
     return scene[codes]
+
+
+def dry_share_stats(meta: pd.DataFrame, X: np.ndarray, feats: list[str], cfg: dict) -> dict:
+    """Dry-scene share of one loaded frame (D196 report): scenes (t0) and rows, with the row-level breakdown."""
+    row_dry, st = dry_rows(X, feats, cfg)
+    codes, uniq = pd.factorize(meta["t0"])
+    scene = np.ones(len(uniq), bool)
+    np.logical_and.at(scene, codes, row_dry)
+    return {**st, "scenes": int(len(uniq)), "dry_scenes": int(scene.sum()),
+            "dry_scene_share": float(scene.mean()) if len(uniq) else float("nan"),
+            "dry_scene_row_share": float(scene[codes].mean()) if len(codes) else float("nan")}
 
 
 def keep_draw(t0: pd.Series, seed: str) -> np.ndarray:
@@ -237,8 +281,50 @@ def downsample(meta: pd.DataFrame, X: np.ndarray, feats: list[str], cfg: dict, p
     u = keep_draw(meta["t0"], str(cfg["downsampling"]["seed"]))
     drop = dry & (u >= p)
     w = np.where(dry & ~drop, 1.0 / p, 1.0).astype("float32")
-    return drop, w, dry, {"p": p, "rain_columns": len(rain_columns(feats, cfg)), "dry_rows": int(dry.sum()),
-                     "rows": int(len(dry))}
+    return drop, w, dry, {"p": p, "rain_columns": len(rain_columns(feats, cfg)),
+                          "motion_columns": len(motion_columns(rain_columns(feats, cfg), cfg)),
+                          "dry_rows": int(dry.sum()), "rows": int(len(dry))}
+
+
+def dry_full_id(cfg: dict) -> str:
+    fm = cfg["downsampling"]["full_month_check"]
+    return f"dry-full-{int(fm['season'])}-{int(fm['month']):02d}"
+
+
+def run_dry_full(unit, ctx: Ctx) -> tuple[list[str], dict]:
+    """D196: dry-scene share on ONE full month of the full Gold table_v2 (read only; gold id, season and month fixed
+    in downsampling.full_month_check before any measurement), per frame, streamed one frame at a time."""
+    import pyarrow.parquet as pq
+    from src.gold import build_table_v2 as BT2
+    fm = ctx.cfg["downsampling"]["full_month_check"]
+    y, m, gid = int(fm["season"]), int(fm["month"]), str(fm["gold_id"])
+    key = f"{GOLD_REMOTE}gid={gid}/season={y}/month={m:02d}/part.parquet"
+    have = ctx.store.list(key)
+    if key not in have:
+        raise RuntimeError(f"{unit.id}: {key} not found (full Gold month for the dry-share check)")
+    dst = root() / "data" / "_scratch" / "p4e" / "dry_full" / f"gid={gid}" / f"season={y}_month={m:02d}.parquet"
+    ctx._download(key, have[key], dst)
+    names = pq.read_schema(dst).names
+    feats = BT2.feature_columns(names)
+    cols = rain_columns(feats, ctx.cfg)
+    lead_vals = sorted(int(v) for v in pd.read_parquet(dst, columns=["lead_min"])["lead_min"].unique())
+    per = []
+    for L in lead_vals:
+        df = pd.read_parquet(dst, columns=["t0", "pixel_id", "is_city"] + cols, filters=[("lead_min", "==", L)])
+        X = df[cols].to_numpy("float32")
+        st = dry_share_stats(df[["t0"]], X, cols, ctx.cfg)
+        city = df["is_city"].to_numpy("float32") == 1
+        per.append({"lead_min": L, "pixels": int(df["pixel_id"].nunique()), "city_pixels":
+                    int(df.loc[city, "pixel_id"].nunique()), **st})
+        del df, X
+    out = {"unit": unit.id, "gold_key": key, "gold_id": gid, "season": y, "month": m,
+           "definition": "D196: raw rain windows non-NaN and exactly 0, motion-derived (adv_*, upwind_*) 0 or NaN, "
+                         "every pixel of the scene (city + ring); inputs only", "rain_columns": cols,
+           "motion_columns": motion_columns(cols, ctx.cfg), "per_frame": per, "note": NOT_FLOOD}
+    p = out_dir("compare") / f"{unit.id}.json"
+    write_json(p, out)
+    return [rel(p)], {"dry_scene_share": [round(r["dry_scene_share"], 4) for r in per],
+                      "scenes": [r["scenes"] for r in per]}
 
 
 def rain_scene(meta: pd.DataFrame, cfg: dict) -> np.ndarray:
@@ -487,7 +573,11 @@ def cost_table(ctx) -> pd.DataFrame:
                      "median_rounds": f["median_rounds"], "seconds_actual": mk["metrics"].get("seconds"),
                      "seconds_from_work_model": f["predicted_seconds_from_work"],
                      "seconds_planned": round(60 * est[u.id], 1)})
-    return pd.DataFrame(rows)
+    t = pd.DataFrame(rows)
+    if len(t):                                         # D196: per-unit predicted vs actual; > 1.5x off -> stop, report
+        t["ratio_actual_planned"] = t["seconds_actual"] / t["seconds_planned"]
+        t["off_1p5x"] = (t["ratio_actual_planned"] > COST_RATIO_STOP) | (t["ratio_actual_planned"] < 1 / COST_RATIO_STOP)
+    return t
 
 
 def gate_cmp(ctx: Ctx) -> tuple[list[str], dict]:
@@ -539,8 +629,11 @@ def gate_cmp(ctx: Ctx) -> tuple[list[str], dict]:
     pd.DataFrame(diffs).to_csv(out / "diffs.csv", index=False)
     ct = cost_table(ctx)
     ct.to_csv(out / "cost.csv", index=False)
+    dry_full = [ctx.read_json(f"{OUT}/compare/{u.id}.json") for u in units(cfg) if u.kind == "dry"]
     checks = {"rounds_check_ok": rc["ok"], "equivalence_smoke_informative": eqv, "two_stage_violation": viol,
-              "downsampling": ds_info, "note": "smoke: one fold, one frame; verdicts here are informative only, "
+              "downsampling": ds_info, "dry_full_month": [{k: d[k] for k in ("gold_id", "season", "month",
+                                                                             "per_frame")} for d in dry_full],
+              "cost_units_off_1p5x": int(ct["off_1p5x"].sum()) if len(ct) else 0, "note": "smoke: one fold, one frame; verdicts here are informative only, "
                                                "never a P4E.1 / P4E.3 decision. " + NOT_FLOOD}
     write_json(out / "checks.json", checks)
     rels = [rel(out / f) for f in ("rounds_check.json", "metrics.csv", "diffs.csv", "cost.csv", "checks.json")]
@@ -548,6 +641,71 @@ def gate_cmp(ctx: Ctx) -> tuple[list[str], dict]:
                   "two_stage_violation": [round(v["violation_rate"], 4) for v in viol],
                   "dry_share_training": [round(x["dry_share_training"], 4) for x in ds_info if x],
                   "fits": len(ct)}
+
+
+FIG_COLS = ["pixel_id", "t0", "day", "half", "role", "label_source", "label_rate_mm_h", "pers", "y", "p_raw", "p_cal",
+            "yhat", "season_fold"]
+
+
+def fig_spec(cfg: dict) -> dict:
+    """Models of the P4E.6 figures (D196). Full job: v1 (B), Model 1-B, Model 1 (A) (+ persistence); replay pair
+    v1 (B) / Model 1-B; diagnosis pair M0 / Model 1. The smoke has no set-B model: M0 and Model 1 stand in, and the
+    figure titles say so."""
+    if not cfg.get("smoke"):
+        return {"models": [("v1B", "v1b", "v1b"), ("Model1-B", "m1b", "m1b"), ("Model1-A", "m1", "m1")],
+                "replay": ["v1B", "Model1-B"], "diag": [("M0", "m0", "m0"), ("Model1", "m1", "m1")],
+                "title": "P4E"}
+    return {"models": [("M0", "m0", "m0"), ("Model1", "m1", "m1")], "replay": ["M0", "Model1"],
+            "diag": [("M0", "m0", "m0"), ("Model1", "m1", "m1")],
+            "title": "P4E SMOKE (fold 2024, F0; M0 / Model 1 stand in for v1 (B) / Model 1-B)"}
+
+
+def gate_figs(ctx: Ctx) -> tuple[list[str], dict]:
+    """P4E.6 figures on the cloud (src/models/p4e_figs.py), PNG + CSV under reports/p4e/figs/."""
+    from src.models import p4e_figs as FG
+    cfg, ev = ctx.cfg, ctx.cfg["evaluation"]
+    fs = fig_spec(cfg)
+    pt, hv = primary(cfg), heavy(cfg)
+    thrs, Ls = [pt, hv], leads(cfg)
+    out = out_dir("figs")
+    n, seed, lvl = int(ev["bootstrap_resamples"]), int(cfg["random_seed"]), float(ev["ci_level"])
+
+    def frames(spec_list, roles):
+        F = {}
+        for name, spec, nested in spec_list:
+            for t in thrs:
+                for L in Ls:
+                    j = _frame(ctx, spec, L, t, nested if t == hv else None, roles)
+                    F[(name, float(t), int(L))] = j[[c for c in FIG_COLS if c in j.columns]].copy()
+        return F
+    models = [m for m, _, _ in fs["models"]]
+    Fe = frames(fs["models"], ("eval",))
+    paths, tables = [], {}
+    p, tables["reliability"] = FG.reliability(Fe, models, thrs, Ls, out, fs["title"], ev["reliability_bins"])
+    paths += p
+    p, tables["scores_ci"] = FG.scores_ci(Fe, models, thrs, Ls, out, fs["title"], n, seed, lvl)
+    paths += p
+    p, tables["fss"] = FG.fss(Fe, models, thrs, Ls, out, fs["title"], [1, 3, 5], n, seed, lvl)
+    paths += p
+    p, tables["halfmonth_csi"] = FG.halfmonth_csi(Fe, models, thrs, Ls, out, fs["title"])
+    paths += p
+    del Fe
+    Fa = frames([x for x in fs["models"] if x[0] in fs["replay"]], ("eval", "secondary"))
+    days = FG.event_days(cfg, Fa, fs["replay"][0], pt, Ls[0])
+    p, tables["replay"] = FG.replay(Fa, fs["replay"], pt, Ls, days, out, fs["title"])
+    paths += p
+    del Fa
+    Fd = frames(fs["diag"], ("eval",))
+    p, tables["diagnosis"] = FG.diagnosis(Fd, [m for m, _, _ in fs["diag"]], thrs, Ls, out, fs["title"])
+    paths += p
+    for k, t in tables.items():
+        t = t.copy()
+        t["note"] = NOT_FLOOD
+        t.to_csv(out / f"{k}.csv", index=False)
+    rels = [rel(x) for x in paths] + [rel(out / f"{k}.csv") for k in tables]
+    rp = tables["replay"]
+    return rels, {"png": len(paths), "replay_ok": int((rp["status"] == "ok").sum()) if len(rp) else 0,
+                  "replay_skipped": int((rp["status"] != "ok").sum()) if len(rp) else 0}
 
 
 def gate_compare_done(ctx: Ctx) -> tuple[list[str], dict]:
@@ -571,7 +729,8 @@ def gate_g2(ctx: Ctx):
         return PD.gate_g2(ctx)
 
 
-GATES = {"preflight": gate_preflight, "g2": gate_g2, "cmp": gate_cmp, "compare-done": gate_compare_done}
+GATES = {"preflight": gate_preflight, "g2": gate_g2, "cmp": gate_cmp, "figs": gate_figs,
+         "compare-done": gate_compare_done}
 
 
 def run_unit(unit, ctx: Ctx) -> tuple[list[str], dict]:
@@ -582,6 +741,8 @@ def run_unit(unit, ctx: Ctx) -> tuple[list[str], dict]:
             return PD.run_base(unit, ctx)
     if unit.kind == "fit":
         return run_fit(unit, ctx)
+    if unit.kind == "dry":
+        return run_dry_full(unit, ctx)
     if unit.kind == "gate":
         return GATES[unit.id](ctx)
     raise ValueError(unit.kind)
@@ -642,6 +803,8 @@ def unit_minutes(cfg: dict, us: list) -> dict:
             out[u.id] = float(gm["feat"])
         elif u.kind == "base":
             out[u.id] = float(gm["base"])
+        elif u.kind == "dry" or u.id in EXTRA_UNIT_MINUTES:
+            out[u.id] = EXTRA_UNIT_MINUTES["dry" if u.kind == "dry" else u.id]
         else:
             out[u.id] = float(gm["done"] if u.id == "compare-done" else gm[u.id])
     return out
@@ -663,7 +826,7 @@ def plan_estimate(cfg: dict, us: list, n: int, um: dict | None = None) -> dict:
     open_g = sum(um[u.id] for u in us if u.kind == "gate" and u.stage <= 2)
     close_g = sum(um[u.id] for u in us if u.kind == "gate" and u.stage > 2)
     feat = [(u.id, um[u.id]) for u in us if u.kind == "feat"]
-    work = [(u.id, um[u.id]) for u in us if u.kind in ("fit", "base")]
+    work = [(u.id, um[u.id]) for u in us if u.kind in ("fit", "base", "dry")]
     fl, wl = lpt(feat, n), lpt(work, n)
     walls = [open_g + f + w for f, w in zip(sorted(fl), sorted(wl, reverse=True))]
     k = int(np.argmax(walls))
@@ -684,7 +847,7 @@ def choose_parts(cfg: dict, us: list, um: dict | None = None) -> dict:
     raise ValueError("no part count meets planning.part_target_minutes")
 
 
-def full_run_plan(cfg: dict, run: str, ds_p: float | None = None, n_ring_near: int = 73) -> tuple[list, dict]:
+def full_run_plan(cfg: dict, run: str, ds_p: float | None = None, n_ring_near: int = 90) -> tuple[list, dict]:
     """Planning-only unit lists of the later P4E runs (not executable yet): 'A' = P4E.1 (full Model 1 and the
     downsampled Model 1 at p in p_grid, 2.5 / 7.6, LOSO 3 folds); 'B' = P4E.2-P4E.4 (+ M0 / Model 1 references at
     every threshold, R-near, W-out, two-stage, Model 1-B and v1 (B) on folds 2024 / 2025). ds_p: downsampling on.

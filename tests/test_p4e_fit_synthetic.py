@@ -99,6 +99,13 @@ def run(tmp_path, monkeypatch):
         p.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(p, index=False)
         p.with_name("part.meta.json").write_text("{}", encoding="utf-8")
+    fm = cfg["downsampling"]["full_month_check"]                 # D196: one "full" Gold month (synthetic, 3 days)
+    df = _partition(rng, fm["season"], fm["month"], [pd.Timestamp(f"{fm['season']}-{fm['month']:02d}-{d:02d}").date()
+                                                     for d in (3, 4, 5)])
+    p = store / (f"lake/v1/gold/met_training/table_v2/gid={fm['gold_id']}/season={fm['season']}/"
+                 f"month={fm['month']:02d}/part.parquet")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(p, index=False)
     for uid in ("preflight", "g2"):                       # need real Silver / A1 Gold: covered by the cloud smoke
         st.put_json(CT.marker_key(JOB, RUN, uid), {"unit": uid, "outputs": {}, "synthetic": True})
     return cfg, store
@@ -166,6 +173,20 @@ def test_smoke_end_to_end(run, tmp_path, capsys):
     assert (df["logloss_lo"] <= df["logloss_hi"]).all() and df["ece_cal_diff"].notna().all()
     cost = pd.read_csv(_r("reports/p4e/compare/cost.csv"))
     assert len(cost) == 6 and cost["seconds_actual"].notna().all() and (cost["work_grows"] > 0).all()
+    assert {"ratio_actual_planned", "off_1p5x"} <= set(cost.columns) and ch["cost_units_off_1p5x"] >= 0
+    # D196: dry-scene share on the full-Gold month (read only) and the cloud figures
+    dfull = json.loads(_r("reports/p4e/compare/dry-full-2024-07.json").read_text(encoding="utf-8"))
+    fr = dfull["per_frame"][0]
+    assert dfull["gold_id"] == "a4a6329bcf13" and fr["scenes"] == 3 * 48 and 0.2 < fr["dry_scene_share"] < 0.5
+    assert ch["dry_full_month"][0]["per_frame"][0]["dry_scenes"] == fr["dry_scenes"]
+    assert not [k for k in st.list("lake/v1/gold/") if "gid=a4a6329bcf13" in k and "month=07" not in k]
+    figs = {k.rsplit("/", 1)[1] for k in st.list(pre + "files/reports/p4e/figs/")}
+    assert {"reliability.png", "scores_ci.png", "fss.png", "halfmonth_csi.png", "diagnosis_p_on_heavy.png",
+            "fss.csv", "replay.csv"} <= figs
+    assert {"replay_yagi_2024-09-07_F0.png", "replay_matmo_2025-10-06_F0.png"} & figs == {
+        "replay_yagi_2024-09-07_F0.png"}                                        # fold 2025 not evaluated in the smoke
+    sc = pd.read_csv(_r("reports/p4e/figs/scores_ci.csv"))
+    assert set(sc["model"]) == {"M0", "Model1", "persistence"}
     # a fit re-run gives identical bytes (outputs carry no timings)
     u = {x.id: x for x in PE.units(cfg)}["fit-m1ds10-s2024-lead0-thr2p5"]
     before = {k: st.get(k) for k in st.list(pre + "files/reports/p4e/") if u.id in k}
