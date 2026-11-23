@@ -9,10 +9,10 @@ on:
   workflow_dispatch:
     inputs:
       job:
-        description: "p4a6 | p4a7 | p4b_smoke | p4b (v1; final only with final=true) | p4b_post (no training) | p4d_smoke (P4D check, minutes) | p4d (v2 cut vs weight, LOSO OOF; stops at COMPARE_DONE)"
+        description: "p4a6 | p4a7 | p4b_smoke | p4b (v1; final only with final=true) | p4b_post (no training) | p4d_smoke (P4D check, minutes) | p4d (v2 cut vs weight, LOSO OOF; stops at COMPARE_DONE) | p4e_smoke (P4E.0 check: single writer, rounds cap, downsampling, two-stage)"
         required: true
         type: choice
-        options: [p4a6, p4a7, p4b_smoke, p4b, p4b_post, p4d_smoke, p4d]
+        options: [p4a6, p4a7, p4b_smoke, p4b, p4b_post, p4d_smoke, p4d, p4e_smoke]
       part:
         description: "i/n — split the units across parallel runs (1/1 = all)"
         required: true
@@ -24,7 +24,7 @@ on:
         default: false
         type: boolean
       race_drill:
-        description: "p4b_smoke only: after the run, re-run its gates and final unit; each must be skipped (race-fix check)"
+        description: "p4b_smoke: re-run its gates and final unit, each must be skipped; p4e_smoke: two contenders commit the same gate at once, exactly one writer (race-fix checks)"
         required: true
         default: false
         type: boolean
@@ -65,12 +65,15 @@ jobs:
           if [ "${{ inputs.job }}" = "p4d" ] || [ "${{ inputs.job }}" = "p4d_smoke" ]; then
             python -m pytest -q tests/test_p4b_race.py tests/test_features_v1.py tests/test_p4d_job.py tests/test_p4d_gold_synthetic.py tests/test_p4d_fit_synthetic.py
           fi
+          if [ "${{ inputs.job }}" = "p4e_smoke" ]; then
+            python -m pytest -q tests/test_features_v1.py tests/test_p4e_race.py tests/test_p4e_job.py tests/test_p4e_fit_synthetic.py
+          fi
       - name: Train
         id: train
         env:
           PYTHONUNBUFFERED: "1"
           # pilot jobs keep the P4A guard; P4B / P4D read IMERG Late (October 2025 labels; Late backfill finished 2026-11-19)
-          HFL_P2B_EXCLUDE_SOURCES: ${{ (inputs.job == 'p4b' || inputs.job == 'p4b_smoke' || inputs.job == 'p4b_post' || inputs.job == 'p4d' || inputs.job == 'p4d_smoke') && 'none' || 'imerg_late' }}
+          HFL_P2B_EXCLUDE_SOURCES: ${{ (inputs.job == 'p4b' || inputs.job == 'p4b_smoke' || inputs.job == 'p4b_post' || inputs.job == 'p4d' || inputs.job == 'p4d_smoke' || inputs.job == 'p4e_smoke') && 'none' || 'imerg_late' }}
           JOB: ${{ inputs.job }}
           PART: ${{ inputs.part }}
           FINAL: ${{ inputs.final }}
@@ -94,6 +97,9 @@ jobs:
           if [ "$JOB" = "p4b" ] || [ "$JOB" = "p4b_smoke" ]; then extra+=(--wait-minutes 120); fi
           # p4d parts wait for each other at every stage (gates, the large stage 5); p4d refuses final / race_drill
           if [ "$JOB" = "p4d" ] || [ "$JOB" = "p4d_smoke" ]; then extra+=(--wait-minutes 150); fi
+          # p4e: parts wait up to 150 min for the opening gates (preflight, feat, g2), then only 5 min for the closing
+          # gates (cmp, compare-done): a part with no work left exits (single writer per output, D188 fix)
+          if [ "$JOB" = "p4e_smoke" ]; then extra+=(--wait-minutes 150); fi
           python -m src.models.cloud_train --job "$JOB" --part "$PART" --max-minutes 320 "${extra[@]}"
       - name: Step summary
         if: always()

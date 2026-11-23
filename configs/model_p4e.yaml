@@ -1,0 +1,104 @@
+# Phase 4E — v2 challenger: Model 1 (M0 + buffer ring), diagnostics, cheaper training
+# (docs/agent_runs/TASK_P4E_MODEL_V2_CHALLENGER.md + hub decisions after P4D). Not a flood model; labels are IMERG
+# (satellite estimate), not rain gauges. v1 stays the official model; nothing here goes to serving.
+#
+# This file is merged ON TOP of configs/model_v2.yaml (base_config): frames, targets, scope, availability, features,
+# pixels and the evaluation design are inherited unchanged (same Gold table_v2 and gold id as P4D for the full job).
+# The model1 / model2 sections of P4D are not used by P4E (no cut, no weight grid: hub 1-2).
+#
+# PRE-REGISTERED (written to DECISIONS D189 with the sha256 of this file BEFORE any P4E training code or result):
+#   rounds_check, downsampling.equivalence, diagnostics.propose_rule, two_stage.use_rule, shadow_gate, planning.
+# If a pre-registered number needs to change after a result exists: stop and ask (TASK P4E, stop conditions).
+version: "v2-p4e"
+base_config: configs/model_v2.yaml
+not_used_from_base: [model2, smoke]          # model1.cut_utc stays only because shared P4D helpers read it; never applied
+
+lightgbm:                     # P4E.0-2 (D190): one learning rate and one cap for ALL P4E models (M0, Model 1, v1 (B),
+  learning_rate: 0.06         #   variants); P4D used 0.03 / 3000 / 150. Other parameters = v1 setting g1, unchanged.
+
+inner_cv:
+  max_rounds: 1500            # N_max
+  early_stopping_rounds: 75   # = 150 x (0.03 / 0.06): same patience in "learning distance"
+
+rounds_check:                 # PRE-REGISTERED (D189): every M0 / Model 1 fit must have median chosen rounds
+  max_share_of_cap: 0.60      #   <= 0.60 x max_rounds (= 900); otherwise stop and ask before any comparison
+  specs: [m0, m1]
+  report_inner_at_cap: true   # share of inner folds whose best iteration is >= max_rounds - early_stopping_rounds
+
+downsampling:                 # P4E.1 (inputs only, never labels)
+  p_grid: [0.1, 0.2]
+  seed: "p4e-dry-scene-v1"    # keep a dry scene iff sha256(seed | t0 UTC ISO) / 2^256 < p (all pixels of t0 together)
+  weight: inverse_p           # kept dry rows get weight 1/p, all other rows 1
+  applies_to: training_rows   # inner-CV training rows and the refit rows; held-out months / evaluation never touched
+  # dry scene = every row of time t0 in the loaded frame (city + ring pixels) has EXACTLY 0 in every rain-valued
+  # input column below (box / ring / upwind / extent features cover the feature neighbourhood out to the domain);
+  # NaN counts as "not dry" (missing input is never treated as zero rain). Set B adds NWP precipitation columns.
+  dry_columns_regex: ['^gc_k\d$', '^raw_k\d$', '^gc_max_k06$', '^gc_mean_k06$', '^nb_r\d+_(mean|max|wet)_k\d$',
+                      '^ring_[NESW]_(mean|wet)_k\d$', '^adv_(rate|max_r1)_F\d+$', '^upwind_(mean|wet)$',
+                      '^extent_wet', '^nwp_.*(precip|rain).*']
+  equivalence:                # PRE-REGISTERED (D189), downsampled Model 1 (set A) minus full-data Model 1,
+                              #   LOSO 2023/2024/2025, pooled OOF on the evaluation set, recalibrated (Platt)
+    logloss_2p5_ci90_within: [-0.0005, 0.0005]    # every frame: the whole 90 % CI inside the interval
+    abs_bss_2p5_max: 0.003                         # every frame, point estimate
+    abs_csi_2p5_max: 0.003                         # every frame, point estimate (OOF-chosen cut)
+    ece_2p5_increase_max: 0.002                    # every frame, recalibrated ECE (10 bins), point estimate
+    csi_7p6_min_diff: -0.005                       # every frame, point estimate (nested rule as Model 1)
+    choose: smallest_p_that_passes                 # p in p_grid; if none passes -> full data everywhere
+
+diagnostics:                  # P4E.2: diagnosis only (events are never a selection criterion, hub 6)
+  w_out_ring_weight: 0.5
+  r_near_margin_px: 3         # TASK text "smaller ring, margin 3": NEEDS_REVIEW before P4E.2 (margin 3 = 481 pixels,
+                              #   a LARGER ring than margin 7 = 177); see REPORT_P4E §0.6
+  propose_rule:               # PRE-REGISTERED (D189): a variant is proposed to the hub only if it beats Model 1 on
+    metric: logloss_cal_2p5   #   pooled OOF log-loss(2.5) (day-summed over F0/F30/F60, as sel-m1a/m1b of P4D)
+    ci90_upper_below: 0.0     #   with the upper 90 % CI bound of (variant - Model 1) < 0
+
+two_stage:                    # P4E.3
+  scene_mm_h: 0.5             # rain scene R: label >= 0.5 at the pixel OR any of its 8 neighbours (same frame, IMERG)
+  neighbourhood: 8            #   neighbours outside the table's pixel set are ignored (edge ring pixels only)
+  threshold_mm_h: 7.6         # P(>=7.6) = P(R) * P(>=7.6 | R); Platt on the product (cross-fit), own OOF cut
+  use_rule:                   # PRE-REGISTERED (D189): the two-stage 7.6 is used in the shadow gate only if it beats
+    metric: logloss_cal_7p6   #   Model 1's nested rule on pooled OOF log-loss(7.6) (day-summed over the frames)
+    ci90_upper_below: 0.0     #   with the upper 90 % CI bound of (two-stage - nested) < 0
+
+shadow_gate:                  # PRE-REGISTERED (D189), P4E.6, Model 1-B vs v1 (B); all must hold
+  at_2p5_every_frame:
+    logloss_diff_ci90_upper_max: 0.0005
+    csi_diff_ci90_lower_min: -0.005
+    bss_min_exclusive: 0.0
+  events_7p6_every_frame:     # pooled event set: Yagi + 10 wettest days per season (IMERG Final labels)
+    pod_diff_min: -0.02
+    csi_diff_min: -0.01
+  matmo_flag_csi_7p6_F0_drop: 0.05   # Late labels: flagged for the hub, never an automatic fail
+
+planning:                     # PRE-REGISTERED (D189) runtime rules, P4E.0-3
+  part_target_minutes: 250
+  part_hard_limit_minutes: 320
+  job_limit_minutes: 350
+  # cost model fitted on the 216 P4D fit units (run 650b5ed0d051, D191): seconds = a + c * W, W = sum over the
+  # boosters of a fit of (rounds actually run x training rows) / 1e9
+  cost_model:
+    ring: {a_s: 167.6, c_s_per_grow: 31.94}     # R^2 0.938, n 180, median |rel err| 0.12
+    city: {a_s: 0.0, c_s_per_grow: 49.0}        # 47-pixel fits: 140-154 s at W 2.7-3.2 (R^2 of a + cW only 0.42)
+  gate_minutes: {preflight: 1, feat: 1, g2: 6, base: 1.5, cmp: 20, done: 1}
+
+race:                         # P4E.0-1 (D188 fix): one writer per shared output
+  claim_stale_minutes: 30     # a claim without marker older than this may be taken over (next generation)
+  claim_poll_seconds: 15
+  loser_scratch_kinds: [gate] # a losing part keeps its gate outputs under runs/<job>/<run_id>/scratch/<attempt>/
+  close_gate_wait_minutes: 5  # closing gates (cmp, compare-done): a part with no work left waits at most this long
+
+r2_budget:
+  max_total_gb: 6.0
+  projected_gold_gb: 0.0      # full job reuses Gold table_v2 gid a4a6329bcf13 (feat units upload nothing if present)
+  projected_run_gb: 0.60
+
+smoke:                        # job p4e_smoke: P4D smoke dates, one fold (2024), one frame (F0), 2.5 and 7.6 mm/h,
+  scope:                      #   real P4E learning rate / cap; one downsampled unit (p 0.1) and one two-stage unit
+    day_ranges: [["2023-05-10", "2023-05-20"], ["2024-10-14", "2024-10-19"], ["2025-07-01", "2025-07-06"],
+                 ["2025-10-06", "2025-10-07"]]   # >= 7.6 events: 2023-05-11/20, 2024-10-15, 2025-07-03/06
+  frames: {lead_min: [0]}
+  targets: {thresholds_mm_h: [2.5, 7.6]}
+  pixels: {ring: {max_pixels: 4}}
+  evaluation: {loso_seasons: [2024], bootstrap_resamples: 200, wettest_days: 3}
+  r2_budget: {projected_gold_gb: 0.01, projected_run_gb: 0.02}

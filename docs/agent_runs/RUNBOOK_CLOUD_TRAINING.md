@@ -149,3 +149,26 @@ Một job làm trọn P4D.3 → P4D.7: Gold `table_v2` (47 pixel thành phố + 
 7. Không dòng nào chứa `OOF_DONE` hay `final_refused`; các `unit_start` `feat-…` chỉ có tháng 2023-05 … 2025-10 (smoke: 2023-05, 2024-10, 2025-05, 2025-10). Dòng `FINAL: false` trong phần env của bước là bình thường.
 
 Trên R2, job chỉ ghi được `lake/v1/runs/<job>/` và `lake/v1/gold/met_training/table_v2/gid=<gold id>/` (khóa khác: `KeyRefused`). Báo agent "p4d_smoke finished" rồi "p4d finished"; agent chạy `python -m src.models.fetch_run --job p4d --run-id 84679b7ec0cf --verify` (chỉ chép vào `reports/p4d/cloud/…`) và viết phần kết quả của REPORT_P4D.
+
+## P4E.1 Smoke `p4e_smoke` (form: job / part / final / race_drill)
+
+| # | Form | Khi nào | Ước lượng |
+|---|---|---|---|
+| 1 | `p4e_smoke` / `1/2` / `false` / `true` | ngay sau khi push | ≈ 38 phút (phần chậm nhất) |
+| 2 | `p4e_smoke` / `2/2` / `false` / `true` | dispatch ngay sau 1 (< 1 phút), để hai phần chạy **song song** | ≈ 16 phút; tổng ≈ 54 phút runner |
+| 3 | (agent) `python -m src.models.fetch_run --job p4e_smoke --run-id d62d80e2f956 --verify` | sau khi cả hai xanh | cục bộ, chỉ đọc |
+
+- Phải dùng **2 phần**: nhóm `concurrency` của workflow là `job + part`, nên hai lần `1/1` sẽ xếp hàng chứ không chạy song song. Với `1/2` và `2/2`, hai phần cùng thấy gate `cmp` / `compare-done` sẵn sàng → race thật trên R2; cộng thêm drill trong tiến trình (`race_drill = true`, hai luồng cùng ghi một gate với byte khác nhau).
+- Mỗi phần chờ tối đa 150 phút cho gate mở đầu (preflight, feat, g2), rồi chỉ 5 phút cho gate kết (cmp, compare-done): phần hết việc thì thoát. Phần không chạy được gate kết vì phần kia đang giữ claim sẽ ghi `claim_yielded` và kết thúc với **exit 0** (không còn exit 3 như D162 / D186).
+- Giữ đúng 2 phần cho cả run (`parts.json`).
+
+## P4E.2 Dòng log cần kiểm tra (bước **Train**)
+
+1. `{"event": "plan", "job": "p4e_smoke", "run_id": "d62d80e2f956", …, "gold_id": "f889057f41ac", "prereg_sha": "58eb5a7e…"}`; `{"event": "estimate", "parts": 2, "part_minutes": […], …}`.
+2. `feat-…`: `"reused": false` ở lần đầu (Gold smoke mới, 4 tháng), `unit_done … "violations": 0` ở `g2`.
+3. `fit-…`: `median_rounds`, `rss_gb`, `work_grows`; mọi `rss_gb` ≤ 10.
+4. `claim_won` (một lần mỗi đơn vị) và, ở phần còn lại, có thể `claim_yielded` / `marker_exists_skip_upload`; **không** có `marker_lost`, `replaced_unmarked_outputs` hay `single-writer breach`.
+5. `{"event": "race_drill_single", "ok": true, "states": {"A": "won", "B": "yielded"} (hoặc ngược lại), "final_equals_marker": true, "loser_exit_code": 0, …}`.
+6. Dòng `end`: `"lost": 0, "output_mismatch": 0`; ở phần thắng `compare-done`: `"compare_complete": true`. Nếu `cmp` lỗi với `rounds check FAIL` (luật pre-registered D189): **dừng**, báo agent, không chạy lại.
+
+Trên R2, job chỉ ghi được `lake/v1/runs/p4e_smoke/` và `lake/v1/gold/met_training/table_v2*/` (khóa khác: `KeyRefused`).

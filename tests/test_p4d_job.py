@@ -272,7 +272,9 @@ def test_estimates_within_limits():
 
 def test_workflow_lists_p4d():
     wf = (PD.CODE_ROOT / ".github" / "workflows" / "train.yml").read_text(encoding="utf-8")
-    assert "p4d_smoke, p4d]" in wf and "--wait-minutes 150" in wf
+    import re
+    opts = [x.strip() for x in re.search(r"options: \[([^\]]*)\]", wf).group(1).split(",")]
+    assert "p4d_smoke" in opts and "p4d" in opts and "--wait-minutes 150" in wf
     assert "tests/test_p4d_job.py" in wf and "inputs.job == 'p4d'" in wf
 
 

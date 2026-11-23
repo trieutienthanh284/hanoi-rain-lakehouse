@@ -50,14 +50,16 @@ from src.realtime import common as C  # noqa: E402
 
 LAKE = "lake/v1/"
 RUNS = LAKE + "runs/"
-JOBS = ("p4a6", "p4a7", "p4b", "p4b_smoke", "p4b_post", "p4d", "p4d_smoke")
+JOBS = ("p4a6", "p4a7", "p4b", "p4b_smoke", "p4b_post", "p4d", "p4d_smoke", "p4e_smoke")
 P4B_JOBS = ("p4b", "p4b_smoke")
 POST_JOBS = ("p4b_post",)        # post-final outputs; reads a fixed p4b run, never trains (src/models/p4b_post.py)
 P4D_JOBS = ("p4d", "p4d_smoke")  # v2 candidates cut vs weight (src/models/p4d.py); no --final in this phase
+P4E_JOBS = ("p4e_smoke",)       # v2 challenger (src/models/p4e.py); the full job p4e is added after the smoke
 SUMMARY_TITLE = {"p4a6": "PILOT v0", "p4a7": "PILOT v0", "p4b": "v1 (P4B)", "p4b_smoke": "v1 smoke (P4B, 2024 only)",
                  "p4b_post": "P4B post-final (no training, no test re-scoring)",
                  "p4d": "v2 candidates cut vs weight (P4D, LOSO OOF only)",
-                 "p4d_smoke": "v2 smoke (P4D, short blocks, 2.5 mm/h only)"}
+                 "p4d_smoke": "v2 smoke (P4D, short blocks, 2.5 mm/h only)",
+                 "p4e_smoke": "v2 challenger smoke (P4E.0: single writer, rounds cap, downsampling, two-stage)"}
 GOLD_REL = "data/gold/met_training/pilot_v0/"
 CODE_FILES = ["src/models/cloud_train.py", "src/models/train_lgbm.py", "src/models/data.py", "src/models/metrics.py",
               "src/models/compare_A_B.py", "src/models/evaluate_lgbm.py", "src/gold/p4a_common.py",
@@ -142,6 +144,9 @@ def run_id_for(job: str) -> str:
     elif job in P4D_JOBS:
         from src.models import p4d as PD
         files = PD.CODE_FILES
+    elif job in P4E_JOBS:
+        from src.models import p4e as PE
+        files = PE.CODE_FILES
     for f in files:
         h.update((ROOT / f).read_bytes().replace(b"\r\n", b"\n"))
     return h.hexdigest()[:12]
@@ -177,6 +182,9 @@ def open_run_store(spec: str, job: str):
     elif job in P4D_JOBS:                         # p4d writes Gold table_v2 (lake/v1/gold/met_training/table_v2/)
         from src.models import p4d as PD
         second = PD.GOLD_REMOTE
+    elif job in P4E_JOBS:                         # p4e: lake/v1/gold/met_training/table_v2*/ (CLAUDE.md §8, P4E)
+        from src.models import p4e as PE
+        second = PE.GOLD_REMOTE_PREFIX
     cfg = {"remote": {"realtime_prefix": f"{RUNS}{job}/", "status_prefix": second,
                       "overwritable_keys": [latest_key(job)], "bucket_env": "R2_BUCKET"}}
     return C.open_store(spec, cfg)
@@ -321,6 +329,203 @@ def commit_unit_safe(store, job: str, run_id: str, unit: Unit, rels: list[str], 
         return {"state": "won", "mismatch": []}
     except C.ObjectConflict:
         return _lost()
+
+
+# ------------------------------------------------------------------------------------------- single writer (D188)
+def attempt_id(tag: str = "") -> str:
+    """Identity of one contender (runner attempt, part, process): written into claims, used for scratch keys."""
+    import uuid
+    gh = os.environ.get("GITHUB_RUN_ID", "local")
+    at = os.environ.get("GITHUB_RUN_ATTEMPT", "0")
+    return f"{gh}-{at}-{os.getpid()}-{uuid.uuid4().hex[:8]}{('-' + tag) if tag else ''}"
+
+
+def claim_key(job: str, run_id: str, unit_id: str, gen: int) -> str:
+    return run_prefix(job, run_id) + f"claims/{unit_id}/g{gen:03d}.json"
+
+
+def put_if_absent(store, key: str, data: bytes) -> bool:
+    """Atomic create: True if this call created the object, False if it already existed. R2: PutObject with
+    If-None-Match (server side); LocalStore: O_CREAT | O_EXCL (the store's own put is check-then-write)."""
+    store.check_key(key)
+    if isinstance(store, C.LocalStore):                # tests: content complete before the name appears
+        import uuid
+        p = store._p(key)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(f"{p.name}.{uuid.uuid4().hex}.part")
+        tmp.write_bytes(data)
+        try:
+            os.link(tmp, p)                            # atomic, fails if the name exists
+            ok = True
+        except FileExistsError:
+            ok = False
+        finally:
+            tmp.unlink()                               # own temporary file of this call only
+        store.ops["class_a"] += 1
+        return ok
+    try:
+        store._put(key, data, C.sha256_bytes(data), False)      # IfNoneMatch="*": never replaces an object
+    except C.ObjectConflict:
+        return False
+    return True
+
+
+def latest_claim(store, job: str, run_id: str, unit_id: str) -> tuple[int, dict | None]:
+    pre = run_prefix(job, run_id) + f"claims/{unit_id}/"
+    keys = sorted(k for k in store.list(pre) if k.endswith(".json"))
+    if not keys:
+        return 0, None
+    k = keys[-1]
+    try:
+        obj = json.loads(store.get(k))
+    except ValueError:                                  # defensive: unreadable claim counts as fresh (never stale)
+        obj = {"written_utc": C.iso(C.utcnow())}
+    return int(k.rsplit("/g", 1)[1][:-5]), obj
+
+
+def take_claim(store, job: str, run_id: str, unit_id: str, me: str, stale_minutes: float) -> int | None:
+    """Generation number of the claim this contender now holds, or None (another contender holds a live claim).
+    Generation 1 is the first claim; a claim older than stale_minutes without a marker may be superseded by the next
+    generation (its holder died between claim and marker). Each generation is created at most once (atomic)."""
+    g, obj = latest_claim(store, job, run_id, unit_id)
+    if obj is not None:
+        age = (C.utcnow() - C.parse_iso(obj["written_utc"])).total_seconds() / 60
+        if age <= stale_minutes or marker_exists(store, job, run_id, unit_id):
+            return None
+    nxt = g + 1
+    body = json.dumps({"unit": unit_id, "gen": nxt, "attempt": me, "written_utc": C.iso(C.utcnow()),
+                       "context": C.run_context()}, indent=1).encode()
+    return nxt if put_if_absent(store, claim_key(job, run_id, unit_id, nxt), body) else None
+
+
+def adopt_outputs(store, job: str, run_id: str, unit_id: str) -> int:
+    """Replace this part's local copies of a unit's outputs with the bytes of the winning marker, so that later
+    units of this part read exactly what R2 holds (P4D: a part's own last-digit variants were read locally)."""
+    mk = json.loads(store.get(marker_key(job, run_id, unit_id)))
+    pre = run_prefix(job, run_id) + "files/"
+    n = 0
+    for key, sha in mk.get("outputs", {}).items():
+        dst = ROOT / key[len(pre):]
+        if dst.is_file() and C.sha256_bytes(dst.read_bytes()) == sha:
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_name(dst.name + ".adopt")
+        tmp.write_bytes(store.get(key))
+        os.replace(tmp, dst)
+        n += 1
+    return n
+
+
+def commit_unit_single(store, job: str, run_id: str, unit: Unit, rels: list[str], metrics: dict, mirror: Path,
+                       payload: dict | None = None, me: str | None = None, stale_minutes: float = 30.0,
+                       poll_seconds: float = 15.0, scratch_kinds=("gate",)) -> dict:
+    """Exactly one writer per unit (D188 fix, P4E.0-1): a contender first wins an atomic claim (If-None-Match); only
+    the claim holder writes the final output keys and the marker. Every other contender writes nothing under the
+    final keys: it waits for the marker, adopts the winner's bytes locally and returns 'yielded' (exit code 0); for
+    gates it keeps its own bytes under runs/<job>/<run_id>/scratch/<attempt>/ for the record.
+    payload: {rel: bytes} instead of reading ROOT/rel (race drill)."""
+    if marker_exists(store, job, run_id, unit.id):
+        adopt_outputs(store, job, run_id, unit.id)
+        C.log("marker_exists_skip_upload", unit=unit.id)
+        return {"state": "skipped", "mismatch": []}
+    me = me or attempt_id()
+    data = payload if payload is not None else {r: (ROOT / r).read_bytes() for r in rels if (ROOT / r).is_file()}
+    waited = 0.0
+    while True:
+        g = take_claim(store, job, run_id, unit.id, me, stale_minutes)
+        if g is not None:
+            break
+        if marker_exists(store, job, run_id, unit.id):
+            if unit.kind in scratch_kinds:
+                for r, b in data.items():
+                    store.put(run_prefix(job, run_id) + f"scratch/{me}/files/{Path(r).as_posix()}", b)
+            if payload is None:
+                adopt_outputs(store, job, run_id, unit.id)
+            C.log("claim_yielded", unit=unit.id, attempt=me, waited_s=round(waited, 1))
+            return {"state": "yielded", "mismatch": []}
+        time.sleep(poll_seconds)
+        waited += poll_seconds
+    outs = {}
+    for r, b in data.items():
+        key = file_key(job, run_id, r)
+        outs[key] = C.sha256_bytes(b)
+        try:
+            store.put(key, b)                                   # if-absent; identical bytes -> exists_identical
+        except C.ObjectConflict:
+            if g == 1:                                          # nobody may write a final key without a claim
+                raise RuntimeError(f"{key} exists although {unit.id} had no earlier claim (single-writer breach)")
+            store.overwritable.add(key)                         # leftover of a dead holder of an older generation
+            try:
+                store.put(key, b, overwrite=True)
+            finally:
+                store.overwritable.discard(key)
+        _mirror(mirror, r, b)
+    if latest_claim(store, job, run_id, unit.id)[0] != g:     # superseded while uploading (holder seen as stale)
+        C.log("claim_superseded", unit=unit.id, gen=g)
+        return {"state": "yielded", "mismatch": []}
+    try:
+        write_marker(store, job, run_id, unit, outs, metrics, mirror)
+    except C.ObjectConflict:
+        other = json.loads(store.get(marker_key(job, run_id, unit.id))).get("outputs", {})
+        mismatch = sorted(k for k, v in outs.items() if other.get(k) != v)
+        C.log("marker_lost", unit=unit.id, outputs=len(outs), mismatch=len(mismatch))
+        return {"state": "lost", "mismatch": mismatch}
+    C.log("claim_won", unit=unit.id, gen=g, attempt=me, outputs=len(outs))
+    return {"state": "won", "mismatch": []}
+
+
+def race_drill_single(store, job: str, run_id: str, unit: Unit, run_unit, mirror: Path, poll_seconds: float = 2.0,
+                      stale_minutes: float = 2.0) -> dict:
+    """Extended race drill (P4E.0-1): the outputs of gate `unit` are committed under a fresh drill unit id by two
+    contenders started at the same instant (threads, barrier) with DIFFERENT bytes. Pass = exactly one writer (one
+    'won', one 'yielded'), every final key byte-identical to the winner's payload and to its marker sha, the loser's
+    bytes only under its scratch prefix, and the loser's exit code 0. Two parts running this drill at the same time
+    race on the same drill unit id as well (the first free drill-<gate>-r<k>)."""
+    import threading
+    rels, metrics = run_unit(unit)
+    k = 1
+    while marker_exists(store, job, run_id, f"drill-{unit.id}-r{k}"):
+        k += 1
+    du = Unit(f"drill-{unit.id}-r{k}", "gate")
+    base = {f"reports/{job}/drill/{du.id}/{Path(r).name}": (ROOT / r).read_bytes() for r in rels
+            if (ROOT / r).is_file()}
+    pay = {"A": base, "B": {r: b + b"\n" for r, b in base.items()}}       # B differs in every file
+    ids = {n: attempt_id(f"drill{n}") for n in pay}
+    res, bar = {}, threading.Barrier(2)
+
+    def go(n):
+        bar.wait()
+        try:
+            res[n] = commit_unit_single(store, job, run_id, du, list(base), metrics, mirror, payload=pay[n],
+                                        me=ids[n], poll_seconds=poll_seconds, stale_minutes=stale_minutes)
+        except Exception as e:                          # noqa: BLE001 — a crashing contender fails the drill
+            res[n] = {"state": f"error:{type(e).__name__}", "mismatch": []}
+    th = [threading.Thread(target=go, args=(n,)) for n in pay]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
+    states = {n: r["state"] for n, r in res.items()}
+    winners = [n for n, s in states.items() if s == "won"]
+    mk = json.loads(store.get(marker_key(job, run_id, du.id))) if marker_exists(store, job, run_id, du.id) else {}
+    have = store.list(file_key(job, run_id, f"reports/{job}/drill/{du.id}/"))
+    final = {r: store.get(file_key(job, run_id, r)) if file_key(job, run_id, r) in have else b"" for r in base}
+    w = winners[0] if len(winners) == 1 else None
+    same_as_winner = w is not None and all(final[r] == pay[w][r] for r in base)
+    same_as_marker = bool(mk) and all(mk["outputs"].get(file_key(job, run_id, r)) == C.sha256_bytes(final[r])
+                                      for r in base)
+    loser = [n for n in pay if n != w]
+    scratch = run_prefix(job, run_id) + "scratch/"
+    loser_scratch = bool(loser) and all(
+        f"{scratch}{ids[loser[0]]}/files/{r}" in store.list(f"{scratch}{ids[loser[0]]}/") for r in base)
+    loser_exit = _exit_code({"mismatch": res[loser[0]]["mismatch"]}) if loser else None
+    ok = (len(winners) == 1 and sorted(states.values()) == ["won", "yielded"] and same_as_winner and same_as_marker
+          and loser_scratch and loser_exit == 0)
+    out = {"ok": ok, "drill_unit": du.id, "states": states, "winner": w, "final_equals_winner": same_as_winner,
+           "final_equals_marker": same_as_marker, "loser_bytes_in_scratch_only": loser_scratch,
+           "loser_exit_code": loser_exit, "files": len(base)}
+    C.log("race_drill_single", **out)
+    return out
 
 
 def parts_lock(store, job: str, run_id: str, n: int) -> tuple[bool, int]:
@@ -550,12 +755,13 @@ def main(argv=None) -> int:
     ap.add_argument("--approve-final", action="store_true",
                     help="with --write-oof-done: set final_approved = true (only after the user said so)")
     ap.add_argument("--race-drill", action="store_true",
-                    help="p4b_smoke only: after the normal loop, run every finished gate and the final unit again; "
-                         "each must be skipped without upload and without rewriting summary.json / done.json")
+                    help="p4b_smoke: after the normal loop, run every finished gate and the final unit again; each "
+                         "must be skipped (no upload, summary.json / done.json unchanged). p4e_smoke: two "
+                         "contenders commit the same gate at the same instant (single-writer drill)")
     a = ap.parse_args(argv)
     t_start = time.time()
-    if a.race_drill and a.job != "p4b_smoke":
-        C.log("refused", reason="--race-drill applies to job p4b_smoke only")
+    if a.race_drill and a.job not in ("p4b_smoke", "p4e_smoke"):
+        C.log("refused", reason="--race-drill applies to jobs p4b_smoke and p4e_smoke only")
         return 2
     if a.job in P4B_JOBS:
         return main_p4b(a, t_start)
@@ -563,6 +769,8 @@ def main(argv=None) -> int:
         return main_post(a, t_start)
     if a.job in P4D_JOBS:
         return main_p4d(a, t_start)
+    if a.job in P4E_JOBS:
+        return main_p4e(a, t_start)
     if a.final:
         C.log("final_refused", job=a.job, reason="--final applies to job p4b only")
         return 2
@@ -727,7 +935,7 @@ def drive(a, t_start: float, store, job: str, run_id: str, allowed: list, run_un
     """Stage loop shared by p4b, p4b_smoke, p4b_post and p4d: run every allowed unit whose dependencies have markers,
     wait for other parts up to --wait-minutes, commit each unit with commit_unit() (p4d: commit_unit_safe())."""
     commit = commit or commit_unit
-    res = {"won": [], "skipped": [], "lost": [], "mismatch": [], "metrics": {}}
+    res = {"won": [], "skipped": [], "lost": [], "yielded": [], "mismatch": [], "metrics": {}}
     waited = 0.0
     while True:
         if (time.time() - t_start) / 60 > a.max_minutes:
@@ -887,6 +1095,97 @@ def main_p4d(a, t_start: float) -> int:
     C.log("end", job=a.job, run_id=run_id, part=f"{i}/{n}", finished_now=len(res["won"]), missing=len(missing),
           compare_complete="compare-done" in done, skipped=len(res["skipped"]), lost=len(res["lost"]),
           output_mismatch=len(res["mismatch"]), store=store.stats(), minutes=round((time.time() - t_start) / 60, 1))
+    return _exit_code(res)
+
+
+def main_p4e(a, t_start: float) -> int:
+    """p4e_smoke (P4E.0): single-writer commits (commit_unit_single, D188 fix), P4E learning rate / round cap, one
+    downsampled and one two-stage unit, comparison gate, cost record; --race-drill runs the extended drill. Stops at
+    compare-done (COMPARE_DONE.json). No --final, no OOF_DONE."""
+    import functools
+    from src.models import p4e as PE
+    if a.final or a.write_oof_done or a.approve_final:
+        C.log("refused", job=a.job, reason="p4e has no --final / --write-oof-done / --approve-final")
+        return 2
+    smoke = a.job == "p4e_smoke"
+    cfg = PE.load_cfg(smoke=smoke)                     # raises if the pre-registered sections changed (D189)
+    i, n = parse_part(a.part)
+    units = PE.units(cfg)
+    mine = PE.part_units(units, i, n)
+    gates = [u for u in units if u.kind == "gate"]
+    run_id = a.run_id or run_id_for(a.job)
+    store = open_run_store(a.store, a.job)
+    done = done_units(store, a.job, run_id)
+    est = PE.plan_estimate(cfg, units, n)
+    C.log("plan", job=a.job, run_id=run_id, part=f"{i}/{n}", units_total=len(units), units_in_part=len(mine),
+          done=len(done), todo=[u.id for u in mine + gates if u.id not in done][:40], smoke=smoke,
+          gold_id=PE.gold_id(cfg), prereg_sha=PE.PREREG_SHA, note=PE.NOT_FLOOD)
+    C.log("estimate", parts=n, part_minutes=est["part_minutes"], runner_minutes=est["runner_minutes"],
+          max_part_minutes=est["max_part_minutes"], within_target=est["within_target"])
+    icv = PE.inner_cv_plan_check(cfg)
+    bad = [r for r in icv if not r["ok"]]
+    C.log("inner_cv_check", ok=not bad, cases=len(icv), failing=bad[:6])
+    if bad:
+        C.log("refused", job=a.job, reason="inner CV would have < 2 usable blocks or < 2 calendar months")
+        return 2
+    if est["max_part_minutes"] > float(cfg["planning"]["part_hard_limit_minutes"]):
+        C.log("refused", job=a.job, reason=f"slowest part estimated at {est['max_part_minutes']} min > hard limit")
+        return 2
+    if a.plan:
+        return 0
+    ok, n0 = parts_lock(store, a.job, run_id, n)
+    if not ok:
+        C.log("refused", job=a.job, run_id=run_id, reason=f"this run is split into {n0} parts; got --part {i}/{n}")
+        return 2
+    mirror = ROOT / "cloud_out" / a.job / run_id
+    lk = latest_key(a.job)                             # deterministic content: parts of one run write equal bytes
+    body = {"job": a.job, "run_id": run_id}
+    if lk not in store.list(lk) or json.loads(store.get(lk)) != body:
+        store.put_json(lk, body, overwrite=True)
+    ctx = PE.Ctx(cfg, store, a.job, run_id, mirror, C.log)
+    rc = cfg["race"]
+    commit = functools.partial(commit_unit_single, stale_minutes=float(rc["claim_stale_minutes"]),
+                               poll_seconds=float(rc["claim_poll_seconds"]),
+                               scratch_kinds=tuple(rc["loser_scratch_kinds"]))
+    # phase 1: opening gates + this part's work units (waits up to --wait-minutes for the opening gates of other
+    # parts); phase 2: closing gates with a short wait, so a part whose work is done exits instead of idling (P4D:
+    # idle waiting at gates was ~1,300 of ~6,700 runner minutes, D191). The part that finishes last runs them.
+    run = lambda u: PE.run_unit(u, ctx)                # noqa: E731
+    opening = [u for u in gates if u.stage <= PE.LAST_OPENING_STAGE]
+    closing = [u for u in gates if u.stage > PE.LAST_OPENING_STAGE]
+    res = drive(a, t_start, store, a.job, run_id, mine + opening, run, mirror, commit=commit)
+    import copy
+    a2 = copy.copy(a)
+    a2.wait_minutes = min(a.wait_minutes, float(rc["close_gate_wait_minutes"]))
+    r2 = drive(a2, t_start, store, a.job, run_id, closing, run, mirror, commit=commit)
+    for k, v in r2.items():
+        if isinstance(v, list):
+            res[k] += v
+        else:
+            res[k].update(v)
+    if a.race_drill:
+        g = {u.id: u for u in gates}[PE.DRILL_GATE]
+        if g.id in done_units(store, a.job, run_id):
+            res["drill"] = race_drill_single(store, a.job, run_id, g, lambda u: PE.run_unit(u, ctx), mirror)
+        else:
+            res["drill"] = {"ok": False, "reason": f"{g.id} not done yet in this run"}
+    done = done_units(store, a.job, run_id)
+    missing = [u.id for u in units if u.id not in done]
+    if "compare-done" in res["won"]:                   # single writer: only the winner of compare-done
+        summ = {"job": a.job, "run_id": run_id, "gold_id": PE.gold_id(cfg),
+                "stage": "P4E.0 smoke complete" if smoke else "P4E comparison complete",
+                "metrics": res["metrics"].get("compare-done"), "note": PE.NOT_FLOOD}
+        store.put_json(run_prefix(a.job, run_id) + "summary.json", summ)
+        store.put_json(run_prefix(a.job, run_id) + "COMPARE_DONE.json",
+                       {"job": a.job, "run_id": run_id, "compare_marker": marker_key(a.job, run_id, "compare-done"),
+                        "note": "stop point: the hub decides (P4E)"})
+    extra = [f"part {i}/{n}; gold `{PE.gold_id(cfg)}`; estimate {est['part_minutes']} min per part",
+             PE.NOT_FLOOD, *_race_lines(res)]
+    write_step_summary(a.job, step_summary(a.job, run_id, res["won"], len(missing), res["metrics"] or None, extra))
+    C.log("end", job=a.job, run_id=run_id, part=f"{i}/{n}", finished_now=len(res["won"]), missing=len(missing),
+          compare_complete="compare-done" in done, skipped=len(res["skipped"]), yielded=len(res["yielded"]),
+          lost=len(res["lost"]), output_mismatch=len(res["mismatch"]), race_drill=res.get("drill"),
+          store=store.stats(), minutes=round((time.time() - t_start) / 60, 1))
     return _exit_code(res)
 
 

@@ -31,7 +31,7 @@ if str(ROOT) not in sys.path:
 from src.models import cloud_train as CT  # noqa: E402
 from src.realtime import common as C  # noqa: E402
 
-MIRROR_ONLY_JOBS = ("p4b_smoke", "p4b_post", "p4d", "p4d_smoke")   # outputs stay in the mirror; never installed (D101)
+MIRROR_ONLY_JOBS = ("p4b_smoke", "p4b_post", "p4d", "p4d_smoke", "p4e_smoke")   # outputs stay in the mirror; never installed (D101)
 INSTALL_PREFIXES = ("models/", "data/gold/met_training/pilot_v0/preds/", "reports/p4a/runs/")
 
 
@@ -105,6 +105,12 @@ def verify(mirror: Path, job: str, run_id: str) -> dict:
            "unlisted": unlisted, "summary_json": (mirror / "summary.json").is_file(),
            "done_json": (mirror / "done.json").is_file(), "compare_done_json": (mirror / "COMPARE_DONE.json").is_file()}
     out["ok"] = not (bad or missing or unlisted)
+    # single-writer evidence (p4e, D188 fix): claim generations per unit and losing contenders' scratch prefixes
+    cl = sorted((mirror / "claims").glob("*/g*.json")) if (mirror / "claims").is_dir() else []
+    out["claims"] = len(cl)
+    out["claims_superseded"] = sorted({p.parent.name for p in cl if p.name != "g001.json"})
+    out["scratch_attempts"] = sorted(p.name for p in (mirror / "scratch").iterdir()) \
+        if (mirror / "scratch").is_dir() else []
     return out
 
 
@@ -127,6 +133,7 @@ def main(argv=None) -> int:
         C.log("verified", job=a.job, run_id=run_id, ok=v["ok"], markers=v["markers"], outputs=v["outputs"],
               sha_mismatch=len(v["sha_mismatch"]), missing=len(v["missing"]), unlisted=len(v["unlisted"]),
               summary_json=v["summary_json"], done_json=v["done_json"], compare_done_json=v["compare_done_json"],
+              claims=v["claims"], claims_superseded=v["claims_superseded"], scratch_attempts=v["scratch_attempts"],
               first_problems=(v["sha_mismatch"] +
                                                                                         v["missing"] + v["unlisted"])[:10])
         return 0 if v["ok"] else 1
