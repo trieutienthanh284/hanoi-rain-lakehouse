@@ -50,16 +50,17 @@ from src.realtime import common as C  # noqa: E402
 
 LAKE = "lake/v1/"
 RUNS = LAKE + "runs/"
-JOBS = ("p4a6", "p4a7", "p4b", "p4b_smoke", "p4b_post", "p4d", "p4d_smoke", "p4e_smoke")
+JOBS = ("p4a6", "p4a7", "p4b", "p4b_smoke", "p4b_post", "p4d", "p4d_smoke", "p4e_smoke", "p4e")
 P4B_JOBS = ("p4b", "p4b_smoke")
 POST_JOBS = ("p4b_post",)        # post-final outputs; reads a fixed p4b run, never trains (src/models/p4b_post.py)
 P4D_JOBS = ("p4d", "p4d_smoke")  # v2 candidates cut vs weight (src/models/p4d.py); no --final in this phase
-P4E_JOBS = ("p4e_smoke",)       # v2 challenger (src/models/p4e.py); the full job p4e is added after the smoke
+P4E_JOBS = ("p4e_smoke", "p4e")  # v2 challenger (src/models/p4e.py); p4e = P4E.2 + P4E.3 + P4E.4 + P4E.6 (D198)
 SUMMARY_TITLE = {"p4a6": "PILOT v0", "p4a7": "PILOT v0", "p4b": "v1 (P4B)", "p4b_smoke": "v1 smoke (P4B, 2024 only)",
                  "p4b_post": "P4B post-final (no training, no test re-scoring)",
                  "p4d": "v2 candidates cut vs weight (P4D, LOSO OOF only)",
                  "p4d_smoke": "v2 smoke (P4D, short blocks, 2.5 mm/h only)",
-                 "p4e_smoke": "v2 challenger smoke (P4E.0: single writer, rounds cap, downsampling, two-stage)"}
+                 "p4e_smoke": "v2 challenger smoke (D198: set B for 224 px, R-near, W-out, two-stage, figures)",
+                 "p4e": "v2 challenger (P4E.2-P4E.4 + P4E.6, LOSO OOF; stops at COMPARE_DONE, the hub decides)"}
 GOLD_REL = "data/gold/met_training/pilot_v0/"
 CODE_FILES = ["src/models/cloud_train.py", "src/models/train_lgbm.py", "src/models/data.py", "src/models/metrics.py",
               "src/models/compare_A_B.py", "src/models/evaluate_lgbm.py", "src/gold/p4a_common.py",
@@ -1099,9 +1100,10 @@ def main_p4d(a, t_start: float) -> int:
 
 
 def main_p4e(a, t_start: float) -> int:
-    """p4e_smoke (P4E.0): single-writer commits (commit_unit_single, D188 fix), P4E learning rate / round cap, one
-    downsampled and one two-stage unit, comparison gate, cost record; --race-drill runs the extended drill. Stops at
-    compare-done (COMPARE_DONE.json). No --final, no OOF_DONE."""
+    """p4e_smoke / p4e (D198): single-writer commits (commit_unit_single, D188 fix), P4E learning rate / round cap,
+    set-B NWP columns, fits of configs: fits (LPT assignment of the units to the parts, p4e.part_units), comparison
+    gates cmp-diag / cmp-2stage / cmp, figures, cost record; --race-drill (p4e_smoke only) runs the extended drill.
+    Stops at compare-done (COMPARE_DONE.json). No --final, no OOF_DONE."""
     import functools
     from src.models import p4e as PE
     if a.final or a.write_oof_done or a.approve_final:
@@ -1111,7 +1113,7 @@ def main_p4e(a, t_start: float) -> int:
     cfg = PE.load_cfg(smoke=smoke)                     # raises if the pre-registered sections changed (D189)
     i, n = parse_part(a.part)
     units = PE.units(cfg)
-    mine = PE.part_units(units, i, n)
+    mine = PE.part_units(units, i, n, cfg)
     gates = [u for u in units if u.kind == "gate"]
     run_id = a.run_id or run_id_for(a.job)
     store = open_run_store(a.store, a.job)
@@ -1120,8 +1122,11 @@ def main_p4e(a, t_start: float) -> int:
     C.log("plan", job=a.job, run_id=run_id, part=f"{i}/{n}", units_total=len(units), units_in_part=len(mine),
           done=len(done), todo=[u.id for u in mine + gates if u.id not in done][:40], smoke=smoke,
           gold_id=PE.gold_id(cfg), prereg_sha=PE.PREREG_SHA, note=PE.NOT_FLOOD)
+    rec = PE.choose_parts(cfg, units, margin=PE.PART_MARGIN)
     C.log("estimate", parts=n, part_minutes=est["part_minutes"], runner_minutes=est["runner_minutes"],
-          max_part_minutes=est["max_part_minutes"], within_target=est["within_target"])
+          max_part_minutes=est["max_part_minutes"], within_target=est["within_target"],
+          proposed_parts=rec["parts"], proposed_part_minutes=rec["part_minutes"],
+          proposed_runner_minutes=rec["runner_minutes"], units_in_part=[u.id for u in mine][:60])
     icv = PE.inner_cv_plan_check(cfg)
     bad = [r for r in icv if not r["ok"]]
     C.log("inner_cv_check", ok=not bad, cases=len(icv), failing=bad[:6])
@@ -1173,7 +1178,7 @@ def main_p4e(a, t_start: float) -> int:
     missing = [u.id for u in units if u.id not in done]
     if "compare-done" in res["won"]:                   # single writer: only the winner of compare-done
         summ = {"job": a.job, "run_id": run_id, "gold_id": PE.gold_id(cfg),
-                "stage": "P4E.0 smoke complete" if smoke else "P4E comparison complete",
+                "stage": "P4E smoke complete (D198)" if smoke else "P4E comparison complete (stop point: the hub)",
                 "metrics": res["metrics"].get("compare-done"), "note": PE.NOT_FLOOD}
         store.put_json(run_prefix(a.job, run_id) + "summary.json", summ)
         store.put_json(run_prefix(a.job, run_id) + "COMPARE_DONE.json",

@@ -9,6 +9,10 @@
 # PRE-REGISTERED (written to DECISIONS D189 with the sha256 of this file BEFORE any P4E training code or result):
 #   rounds_check, downsampling.equivalence, diagnostics.propose_rule, two_stage.use_rule, shadow_gate, planning.
 # If a pre-registered number needs to change after a result exists: stop and ask (TASK P4E, stop conditions).
+#
+# D198 (user, 2026-11-23, after smoke 048a2def9cf8): P4E.1 is NOT run; downsampling is OFF for every P4E run (full
+# data; downsampling.status); NWP for the ring = option A (existing 81 points); R-near = 90 ring pixels (list below);
+# P4E.5 (Tweedie) skipped. The full job p4e runs P4E.2 + P4E.3 + P4E.4 + P4E.6 (fits below).
 version: "v2-p4e"
 base_config: configs/model_v2.yaml
 not_used_from_base: [model2, smoke]          # model1.cut_utc stays only because shared P4D helpers read it; never applied
@@ -26,6 +30,8 @@ rounds_check:                 # PRE-REGISTERED (D189): every M0 / Model 1 fit mu
   report_inner_at_cap: true   # share of inner folds whose best iteration is >= max_rounds - early_stopping_rounds
 
 downsampling:                 # P4E.1 (inputs only, never labels)
+  status: "off"               # D198: P4E.1 not run, no downsampled fit in any P4E run (full data); the D196 code and
+  equivalence_status: not_applied   # tests are kept, unused; the pre-registered equivalence rule below is NOT applied
   p_grid: [0.1, 0.2]
   seed: "p4e-dry-scene-v1"    # keep a dry scene iff sha256(seed | t0 UTC ISO) / 2^256 < p (all pixels of t0 together)
   weight: inverse_p           # kept dry rows get weight 1/p, all other rows 1
@@ -40,6 +46,9 @@ downsampling:                 # P4E.1 (inputs only, never labels)
                       '^ring_[NESW]_(mean|wet)_k\d$', '^adv_(rate|max_r1)_F\d+$', '^upwind_(mean|wet)$',
                       '^extent_wet', '^nwp_.*(precip|rain).*']
   motion_columns_regex: ['^adv_', '^upwind_']
+  share_units:                # D198: read-only finding, dry-scene share (scenes and rows) per month and frame of the
+    gold_id: a4a6329bcf13     #   full Gold table_v2 (one unit dry-full-YYYY-MM per month; smoke: months below only)
+    months: all               #   all = every build month of the full scope (2023-2025, May-Oct: 18 months)
   full_month_check:           # D196: dry-scene share on one full month of the full Gold, measured on the cloud
     gold_id: a4a6329bcf13     #   (smoke unit dry-full-2024-07; a full month does not fit 0.4 GB RSS locally)
     season: 2024              #   month fixed before any measurement (mid-season, not chosen on results)
@@ -57,9 +66,40 @@ diagnostics:                  # P4E.2: diagnosis only (events are never a select
   w_out_ring_weight: 0.5
   r_near_chebyshev_max: 2     # D194: R-near = subset of the 177-pixel ring (domain-edge margin 7 unchanged) with
                               #   Chebyshev distance to the nearest city pixel <= 2 cells = 90 pixels (measured)
+  r_near_count: 90            # D198: recorded list (rain_pixels_hanoi_city + ring rule, 2026-11-23); every R-near
+  r_near_pixels: [            #   fit recomputes the subset from its own data and refuses a mismatch
+    3973655, 3973656, 3973657, 3973658, 3973659, 3973660, 3977255, 3977256, 3977257,
+    3977258, 3977259, 3977260, 3977261, 3977262, 3980854, 3980855, 3980856, 3980859,
+    3980860, 3980861, 3980862, 3984454, 3984455, 3984456, 3984461, 3984462, 3988053,
+    3988054, 3988055, 3988061, 3988062, 3991651, 3991652, 3991653, 3991654, 3991655,
+    3991660, 3991661, 3991662, 3995251, 3995252, 3995253, 3995254, 3995261, 3995262,
+    3998851, 3998852, 3998861, 3998862, 4002451, 4002452, 4002461, 4002462, 4006051,
+    4006052, 4006056, 4006061, 4006062, 4009651, 4009652, 4009653, 4009654, 4009655,
+    4009656, 4009657, 4009660, 4009661, 4009662, 4013251, 4013252, 4013253, 4013254,
+    4013255, 4013256, 4013257, 4013259, 4013260, 4013261, 4013262, 4016856, 4016857,
+    4016858, 4016859, 4016860, 4016861, 4020456, 4020457, 4020458, 4020459, 4020460]
   propose_rule:               # PRE-REGISTERED (D189): a variant is proposed to the hub only if it beats Model 1 on
     metric: logloss_cal_2p5   #   pooled OOF log-loss(2.5) (day-summed over F0/F30/F60, as sel-m1a/m1b of P4D)
     ci90_upper_below: 0.0     #   with the upper 90 % CI bound of (variant - Model 1) < 0
+
+set_b:                        # P4E.4, NWP for the ring = option A (D198): the existing 81 Open-Meteo points
+  nwp_from: "2024-05-01"      #   (previous_day1, gfs_global + ecmwf_ifs025), mapped to every pixel with the v1 code
+  option: A                   #   path features.nwp_point_map (nearest point + mean within 0.3 deg) and
+  table: table_v2_nwp         #   features.compute_nwp_features; no new download. NWP columns are built on the cloud
+  build_version: p4e-nwp-1    #   (units nwp-YYYY-MM) into lake/v1/gold/met_training/table_v2_nwp/gid=<gid>/nid=<id>/
+  feature_prefix: nwp_        #   and joined to table_v2 rows on (pixel_id, t0, lead_min)
+  inner_cv_block: calendar_month   # inner CV of set-B fits: as every other fit (months >= nwp_from only)
+
+fits:                         # D198: full job p4e (P4E.2 + P4E.3 + P4E.4), every frame of frames.lead_min
+  - {spec: m0, folds: [2023, 2024, 2025], thr: [2.5, 7.6]}        # P4E.2 reference M0
+  - {spec: m1, folds: [2023, 2024, 2025], thr: [2.5, 7.6]}        # Model 1 (A) (= M0 + ring)
+  - {spec: m1, folds: [2024, 2025], thr: [0.5]}                   # Model 1 (A) at 0.5 for the P4E.4 table
+  - {spec: rnear, folds: [2023, 2024, 2025], thr: [2.5, 7.6]}     # P4E.2 variant R-near (90 ring pixels)
+  - {spec: wout, folds: [2023, 2024, 2025], thr: [2.5, 7.6]}      # P4E.2 variant W-out (ring weight 0.5)
+  - {spec: m1ts, folds: [2023, 2024, 2025], thr: [7.6]}           # P4E.3 two-stage (set A)
+  - {spec: v1b, folds: [2024, 2025], thr: [0.5, 2.5, 7.6]}        # P4E.4 reference v1 (B), 47 px
+  - {spec: m1b, folds: [2024, 2025], thr: [0.5, 2.5, 7.6]}        # P4E.4 Model 1-B
+  - {spec: m1bts, folds: [2024, 2025], thr: [7.6]}                # two-stage with set B (shadow gate, if P4E.3 rule)
 
 two_stage:                    # P4E.3
   scene_mm_h: 0.5             # rain scene R: label >= 0.5 at the pixel OR any of its 8 neighbours (same frame, IMERG)
@@ -98,15 +138,29 @@ race:                         # P4E.0-1 (D188 fix): one writer per shared output
 
 r2_budget:
   max_total_gb: 6.0
-  projected_gold_gb: 0.0      # full job reuses Gold table_v2 gid a4a6329bcf13 (feat units upload nothing if present)
+  projected_gold_gb: 0.40     # full job reuses Gold table_v2 gid a4a6329bcf13; + NWP columns table_v2_nwp (D198,
+                              #   12 months x ~1.0 M rows, estimate <= 0.4 GB)
   projected_run_gb: 0.60
 
-smoke:                        # job p4e_smoke: P4D smoke dates, one fold (2024), one frame (F0), 2.5 and 7.6 mm/h,
-  scope:                      #   real P4E learning rate / cap; one downsampled unit (p 0.1) and one two-stage unit
+smoke:                        # job p4e_smoke (D198): P4D smoke dates, F0, 2.5 and 7.6 mm/h, FULL ring (224 px), every
+  scope:                      #   code path of the full job p4e; no downsampled unit (D198)
     day_ranges: [["2023-05-10", "2023-05-20"], ["2024-10-14", "2024-10-19"], ["2025-07-01", "2025-07-06"],
                  ["2025-10-06", "2025-10-07"]]   # >= 7.6 events: 2023-05-11/20, 2024-10-15, 2025-07-03/06
   frames: {lead_min: [0]}
   targets: {thresholds_mm_h: [2.5, 7.6]}
-  pixels: {ring: {max_pixels: 4}}
-  evaluation: {loso_seasons: [2024], bootstrap_resamples: 200, wettest_days: 3}
-  r2_budget: {projected_gold_gb: 0.01, projected_run_gb: 0.02}
+  pixels: {ring: {max_pixels: null}}             # 177 ring pixels: NWP set B for 224 px, R-near list checked
+  evaluation: {loso_seasons: [2024, 2025], bootstrap_resamples: 200, wettest_days: 3}
+  # D199: set-B training rows of fold 2025 are the 2024 smoke days only (2024-10-14..19, one month), so the inner CV of
+  # set-B fits uses UTC-day blocks in the smoke (calendar months in the full job); >= 7.6 city rows exist only on
+  # 2024-10-15, so set-B fits run at 2.5 only in the smoke (a 7.6 fit has no usable inner block)
+  set_b: {inner_cv_block: utc_day}
+  fits:
+    - {spec: m0, folds: [2024], thr: [2.5, 7.6]}
+    - {spec: m1, folds: [2024, 2025], thr: [2.5, 7.6]}
+    - {spec: rnear, folds: [2024], thr: [2.5, 7.6]}
+    - {spec: wout, folds: [2024], thr: [2.5, 7.6]}
+    - {spec: m1ts, folds: [2024], thr: [7.6]}
+    - {spec: v1b, folds: [2025], thr: [2.5]}
+    - {spec: m1b, folds: [2025], thr: [2.5]}
+  downsampling: {share_units: {months: [[2024, 7]]}}
+  r2_budget: {projected_gold_gb: 0.05, projected_run_gb: 0.03}

@@ -189,3 +189,26 @@ Dòng log thêm so với P4E.2:
 - `figs` (gate kết, sau `cmp`): `"png": n` (≥ 6), `replay_ok`, `replay_skipped` (Yagi / Matmo không nằm trong fold smoke → bỏ qua, có ghi lý do).
 - Gate kết nay là `cmp` → `figs` → `compare-done`.
 
+
+### P4E.4 Smoke lần 3 sau D198 (run `a98f99cc8388`, gold smoke mới `620730fc8d8d`, vành đủ 177 pixel)
+
+Cùng ngày smoke, 2 part, `race_drill = true`. Smoke này chạy mọi đường mã của job `p4e`: Gold smoke dựng lại với 224 pixel (4 đơn vị `feat`), NWP bộ B cho 224 pixel (`nwp-2024-10`, `nwp-2025-07`, `nwp-2025-10`), fit M0 / Model 1 / R-near / W-out / hai tầng (fold 2024) và v1 (B) / Model 1-B (fold 2025, chỉ 2,5 mm/h, khối CV trong theo ngày UTC, D199), `dry-full-2024-07`, gate `cmp-diag` → `cmp-2stage` → `cmp` → `figs` → `compare-done`.
+
+| # | Form `train` (job / part / final / race_drill) | Ước lượng D191 (hằng số cỡ đầy đủ, smoke thực tế nhỏ hơn nhiều) |
+|---|---|---|
+| 1 | `p4e_smoke` / `1/2` / `false` / `true` | ≈ 34 phút |
+| 2 | `p4e_smoke` / `2/2` / `false` / `true`, dispatch ngay sau 1 | ≈ 103 phút; tổng ≈ 137 phút runner |
+| 3 | (agent) `python -m src.models.fetch_run --job p4e_smoke --run-id a98f99cc8388 --verify` | cục bộ, chỉ đọc |
+
+Dòng log cần kiểm thêm: `nwp-…` (`rows`, `pixels` 224, `points` 81, `nan_share_max`); `g2` (`set_b_inner_cv_ok true`, `nwp_partitions 3`); `fit-rnear-…` (`train_rows` < Model 1); `cmp-diag` (`proposed`), `cmp-2stage` (`use_two_stage`), `cmp` (`shadow_gate_complete false` là đúng trong smoke: không có fit bộ B ở 7,6).
+
+### P4E.5 Job đầy đủ `p4e` (D198; CHỈ dispatch sau khi người dùng duyệt smoke `a98f99cc8388`)
+
+Run `ae8fd71879ba`, Gold `a4a6329bcf13` (tái dùng), NWP `table_v2_nwp/gid=a4a6329bcf13/nid=e72f7fd94ad0/` (dựng mới, 12 tháng). 193 đơn vị: 129 fit, 12 `nwp`, 18 `dry-full-*`, 9 `base`, 18 `feat` (tái dùng), 7 gate. Đơn vị được gán cho part bằng LPT theo ước lượng D191 (mọi part phải dùng cùng n = 7).
+
+| Part | Ước lượng (phút) |
+|---|---|
+| 1/7 … 7/7 | 196,1 (part chạy gate kết: ≈ 120 + 76), 126,8, 126,9, 126,0, 125,8, 126,0, 125,8 |
+| Tổng | ≈ 953 phút runner; part chậm nhất ≤ 200 (= 0,8 × 250); `--max-minutes 320` giữ làm chặn |
+
+Dispatch 7 form `p4e` / `i/7` / `false` / `false` liền nhau. Part hết việc thì thoát; part chạy cuối làm gate kết. Nếu part nào hết giờ (`time_budget_reached`), dispatch lại đúng part đó (tiếp tục được). Sau run: agent `python -m src.models.fetch_run --job p4e --run-id ae8fd71879ba --verify`, rồi báo `compare/cost.csv` dự báo/thực tế (đơn vị lệch > 1,5× được đánh dấu).
