@@ -1,0 +1,109 @@
+# Flood indicator (icon on the web map) — chỉ báo dựa trên lượng mưa tích lũy.
+# NOT a flood probability and NOT a FLOOD / NO FLOOD prediction. Absence of an icon is not "no flood".
+# User decision 2026-11-19 (binding): one variable, the rolling 6-hour rain accumulation at a cell (A6h, mm).
+#   A6h < a                → no icon
+#   a <= A6h < b           → "Có thể ngập"       (yellow "!")
+#   A6h >= b               → "Nguy cơ ngập cao"  (red "!")
+#   A24h >= long_rule.mm   → at least the red level
+# a, b and the 150 mm rule are GAUGE-SCALE (rain amounts quoted from gauges in the evidence).
+# The agent never changes a, b or the long rule. `satellite_proposal` (ratio-based, U1.7) is REJECTED
+# (user decision U1-D1, 2026-11-20); GSMaP proposals live in `gsmap_now_thresholds` (NEEDS_REVIEW).
+#
+# Evidence behind the decision (U0 documents):
+#   - KTTV warning 23/7/2024 03h45: 20–50 mm in 3 h, locally > 70 mm, street-flood warning (Tổng cục KTTV, NGLU-16)
+#   - 28/9/2023: Hoàng Mai 105 mm in 6 h (0h–6h), water up to 0.7 m (VnExpress International)
+#   - 24/7/2024: 150–300 mm, deep flooding from night to morning (Tuổi Trẻ)
+#   - 26/8/2025 (Kajiki): up to 270 mm by 6:00 (Tuổi Trẻ News)
+#   - 30/9/2025 (Bualoi): commonly 250–350 mm, Ô Chợ Dừa 527 mm, about 116 flood points (Nhân Dân, VOV)
+#   - Drainage design capacity 310 mm / 2 days (Sở Xây dựng Hà Nội; Thanh Tra, Nhân Dân)
+#   - Yagi morning 7/9/2024: 15–42 mm without reported inner-city flooding (Báo Đấu Thầu)
+
+variable: A6h
+a_mm: 50
+b_mm: 100
+long_rule: {window_h: 24, mm: 150, level: high}
+scale: gauge
+satellite_factor: null
+status: provisional
+decided: 2026-11-19
+levels:
+  none: {icon: null}
+  possible: {icon: "!", colour: yellow, label_vi: "Có thể ngập"}
+  high: {icon: "!", colour: red, label_vi: "Nguy cơ ngập cao"}
+history_mode: observed rain only — A6h / A24h over the past 6 h / 24 h ending at the time of interest
+serving_mode_P5: "A6h(t) = observed (t-5h, t] + nowcast (t, t+1h]; documented only, not implemented in U1"
+wording: "chỉ báo dựa trên lượng mưa tích lũy"
+
+# --- product_thresholds (user decision U1-D1, 2026-11-20) -------------------------------------------
+# IMERG Final / Late: the gauge-scale thresholds are used directly (factor 1.0). Basis: REPORT_U1 §13.5 —
+# 12.2 % (Final) / 14.8 % (Late) of rainy-season days with an icon, 2.3 % / 3.1 % with red, and a signal on
+# 28/9/2023, 24/7/2024 and 30/9/2025. Chỉ báo dựa trên lượng mưa tích lũy; not a flood probability.
+product_thresholds:
+  imerg_final: {label: "IMERG Final V07", a_mm: 50, b_mm: 100, long_mm: 150, satellite_factor: 1.0, status: provisional, decided: 2026-11-20, decision: U1-D1, basis: "REPORT_U1 §13.5"}
+  imerg_late: {label: "IMERG Late V07", a_mm: 50, b_mm: 100, long_mm: 150, satellite_factor: 1.0, status: provisional, decided: 2026-11-20, decision: U1-D1, basis: "REPORT_U1 §13.5"}
+  # user decision U1-D2 (2026-11-20): GSMaP NOW GC uses its own scale (b = 2a, A24h threshold independent of a);
+  # 9/10 reference days caught, 11.6 % / 4.9 % of 2024–2025 rainy-season days with an icon / red (REPORT_U1 §16.2).
+  gsmap_now_gc: {label: "GSMaP NOW rain_rate_gc_mm_h", a_mm: 110, b_mm: 220, long_mm: 270, status: provisional, decided: 2026-11-20, decision: U1-D2, basis: "REPORT_U1 §16.2 rank 1"}
+  gsmap_now: {label: "GSMaP NOW rain_rate_mm_h", status: not_used_for_icon, decided: 2026-11-20, decision: U1-D2, reason: "best load-feasible setting catches 6/10 reference days"}
+
+# GSMaP NOW (raw rate and gauge-corrected GC): NOT decided. Candidate sets below are agent proposals
+# (REPORT_U1 §14.2); equal-frequency = same pixel-hour exceedance share as IMERG Final at 50 / 100 mm (A6h)
+# and 150 mm (A24h) over the 47 city pixels and the hours where both products exist; rounded to 5 mm.
+gsmap_now_thresholds:
+  status: NEEDS_REVIEW
+  computed: 2026-11-20
+  source_tables: [reports/u1/followup2/eqfreq_thresholds.csv, reports/u1/followup2/gsmap_sweep_marks.csv]
+  products:
+    gsmap_now:
+      label: "GSMaP NOW rain_rate_mm_h"
+      status: NEEDS_REVIEW
+      proposals:
+        eqfreq_2023_2025: {a_mm: 145, b_mm: 435, long_mm: 425, unrounded: [142.6, 434.9, 426.5], share_days_any_icon: 0.0991, share_days_red: 0.0234, rain_days_missed: "2023-09-28;2024-05-12;2024-05-30;2024-07-23;2024-09-09;2024-09-16;2025-08-25;2025-08-26;2025-09-30;2025-10-07;2025-10-08", status: NEEDS_REVIEW}
+        eqfreq_2024_2025: {a_mm: 115, b_mm: 350, long_mm: 320, unrounded: [116.8, 349.1, 320.6], share_days_any_icon: 0.1387, share_days_red: 0.0541, rain_days_missed: "2024-05-12;2024-05-30;2024-09-09;2025-08-25;2025-08-26;2025-09-30;2025-10-07;2025-10-08", status: NEEDS_REVIEW}
+      sweep_candidates:  # b = 2a, long = 3a; shares over 2023–2025 rainy-season days; NEEDS_REVIEW
+        a70: {a_mm: 70, b_mm: 140, long_mm: 210, share_days_any_icon: 0.2342, share_days_red: 0.1387, n_rain_days_missed: 6, status: NEEDS_REVIEW}
+        a80: {a_mm: 80, b_mm: 160, long_mm: 240, share_days_any_icon: 0.2, share_days_red: 0.1153, n_rain_days_missed: 7, status: NEEDS_REVIEW}
+        a90: {a_mm: 90, b_mm: 180, long_mm: 270, share_days_any_icon: 0.1856, share_days_red: 0.0991, n_rain_days_missed: 8, status: NEEDS_REVIEW}
+        a100: {a_mm: 100, b_mm: 200, long_mm: 300, share_days_any_icon: 0.1676, share_days_red: 0.0847, n_rain_days_missed: 8, status: NEEDS_REVIEW}
+        a110: {a_mm: 110, b_mm: 220, long_mm: 330, share_days_any_icon: 0.1495, share_days_red: 0.0739, n_rain_days_missed: 8, status: NEEDS_REVIEW}
+        a120: {a_mm: 120, b_mm: 240, long_mm: 360, share_days_any_icon: 0.1297, share_days_red: 0.0613, n_rain_days_missed: 9, status: NEEDS_REVIEW}
+        a130: {a_mm: 130, b_mm: 260, long_mm: 390, share_days_any_icon: 0.1135, share_days_red: 0.0468, n_rain_days_missed: 10, status: NEEDS_REVIEW}
+        a140: {a_mm: 140, b_mm: 280, long_mm: 420, share_days_any_icon: 0.1063, share_days_red: 0.0378, n_rain_days_missed: 10, status: NEEDS_REVIEW}
+        a150: {a_mm: 150, b_mm: 300, long_mm: 450, share_days_any_icon: 0.0973, share_days_red: 0.0324, n_rain_days_missed: 11, status: NEEDS_REVIEW}
+      followup3_top3:  # REPORT_U1 §16; b = 2a, L independent; loads on 2024–2025; NEEDS_REVIEW
+        rank1: {a_mm: 120, b_mm: 240, long_mm: 330, share_days_any_icon_2024_2025: 0.1081, share_days_red_2024_2025: 0.0459, share_days_any_icon_2023_2025: 0.1297, ref_days_caught: "6/10", ref_days_missed: "2023-09-28;2025-09-30;2025-10-07;2025-10-08", status: NEEDS_REVIEW}
+        rank2: {a_mm: 140, b_mm: 280, long_mm: 330, share_days_any_icon_2024_2025: 0.0892, share_days_red_2024_2025: 0.0405, share_days_any_icon_2023_2025: 0.1081, ref_days_caught: "5/10", ref_days_missed: "2023-09-28;2024-07-23;2025-09-30;2025-10-07;2025-10-08", status: NEEDS_REVIEW}
+        rank3: {a_mm: 130, b_mm: 260, long_mm: 330, share_days_any_icon_2024_2025: 0.0919, share_days_red_2024_2025: 0.0405, share_days_any_icon_2023_2025: 0.1153, ref_days_caught: "5/10", ref_days_missed: "2023-09-28;2024-07-23;2025-09-30;2025-10-07;2025-10-08", status: NEEDS_REVIEW}
+    gsmap_now_gc:
+      label: "GSMaP NOW rain_rate_gc_mm_h"
+      status: NEEDS_REVIEW
+      proposals:
+        eqfreq_2023_2025: {a_mm: 130, b_mm: 275, long_mm: 350, unrounded: [128.4, 272.7, 351.7], share_days_any_icon: 0.0955, share_days_red: 0.0234, rain_days_missed: "2024-05-12;2024-05-30;2024-07-23;2024-08-22;2024-09-09;2025-08-25;2025-08-26;2025-09-30;2025-10-07;2025-10-08", status: NEEDS_REVIEW}
+        eqfreq_2024_2025: {a_mm: 115, b_mm: 235, long_mm: 330, unrounded: [114.9, 236.9, 329.3], share_days_any_icon: 0.1099, share_days_red: 0.027, rain_days_missed: "2024-05-12;2024-05-30;2024-09-09;2025-08-25;2025-08-26;2025-09-30;2025-10-07;2025-10-08", status: NEEDS_REVIEW}
+      sweep_candidates:  # b = 2a, long = 3a; shares over 2023–2025 rainy-season days; NEEDS_REVIEW
+        a70: {a_mm: 70, b_mm: 140, long_mm: 210, share_days_any_icon: 0.2108, share_days_red: 0.1099, n_rain_days_missed: 5, status: NEEDS_REVIEW}
+        a80: {a_mm: 80, b_mm: 160, long_mm: 240, share_days_any_icon: 0.1784, share_days_red: 0.0919, n_rain_days_missed: 5, status: NEEDS_REVIEW}
+        a90: {a_mm: 90, b_mm: 180, long_mm: 270, share_days_any_icon: 0.164, share_days_red: 0.0721, n_rain_days_missed: 6, status: NEEDS_REVIEW}
+        a100: {a_mm: 100, b_mm: 200, long_mm: 300, share_days_any_icon: 0.1441, share_days_red: 0.0505, n_rain_days_missed: 7, status: NEEDS_REVIEW}
+        a110: {a_mm: 110, b_mm: 220, long_mm: 330, share_days_any_icon: 0.1171, share_days_red: 0.0324, n_rain_days_missed: 7, status: NEEDS_REVIEW}
+        a120: {a_mm: 120, b_mm: 240, long_mm: 360, share_days_any_icon: 0.1081, share_days_red: 0.0234, n_rain_days_missed: 8, status: NEEDS_REVIEW}
+        a130: {a_mm: 130, b_mm: 260, long_mm: 390, share_days_any_icon: 0.0919, share_days_red: 0.0198, n_rain_days_missed: 10, status: NEEDS_REVIEW}
+        a140: {a_mm: 140, b_mm: 280, long_mm: 420, share_days_any_icon: 0.0811, share_days_red: 0.0144, n_rain_days_missed: 11, status: NEEDS_REVIEW}
+        a150: {a_mm: 150, b_mm: 300, long_mm: 450, share_days_any_icon: 0.0757, share_days_red: 0.009, n_rain_days_missed: 12, status: NEEDS_REVIEW}
+      followup3_top3:  # REPORT_U1 §16; b = 2a, L independent; loads on 2024–2025; NEEDS_REVIEW
+        rank1: {a_mm: 110, b_mm: 220, long_mm: 270, share_days_any_icon_2024_2025: 0.1162, share_days_red_2024_2025: 0.0486, share_days_any_icon_2023_2025: 0.1243, ref_days_caught: "9/10", ref_days_missed: "2025-10-08", status: NEEDS_REVIEW}
+        rank2: {a_mm: 100, b_mm: 200, long_mm: 270, share_days_any_icon_2024_2025: 0.127, share_days_red_2024_2025: 0.0486, share_days_any_icon_2023_2025: 0.1477, ref_days_caught: "9/10", ref_days_missed: "2025-10-08", status: NEEDS_REVIEW}
+        rank3: {a_mm: 120, b_mm: 240, long_mm: 270, share_days_any_icon_2024_2025: 0.1054, share_days_red_2024_2025: 0.0486, share_days_any_icon_2023_2025: 0.1171, ref_days_caught: "8/10", ref_days_missed: "2025-10-07;2025-10-08", status: NEEDS_REVIEW}
+
+# --- satellite_proposal (agent, U1.7) — REJECTED by the user 2026-11-20 (decision U1-D1). Kept for the record.
+# Ratio = satellite pixel-mean accumulation / reported gauge amount (reports/u1/indicator_ratio_table.csv).
+satellite_proposal:
+  status: REJECTED
+  rejected: 2026-11-20
+  reason: "47 % of rainy-season days with an icon (IMERG Final 20/40/60); ratio estimated from 2 extreme episodes only"
+  computed: 2026-11-20
+  record_set: primary (period_basis clock or end_only_24h, dedup)
+  products:
+    imerg_final: {label: "IMERG Final V07", n_records: 26, median_ratio: 0.385, iqr_ratio: [0.35, 0.608], proposed_satellite_a_mm: 20, proposed_satellite_b_mm: 40, proposed_satellite_long_mm: 60}
+    gsmap: {label: "GSMaP NOW", n_records: 32, median_ratio: 0.424, iqr_ratio: [0.3, 0.792], proposed_satellite_a_mm: 20, proposed_satellite_b_mm: 40, proposed_satellite_long_mm: 65}
+    gsmap_gc: {label: "GSMaP NOW GC", n_records: 32, median_ratio: 0.612, iqr_ratio: [0.437, 0.931], proposed_satellite_a_mm: 30, proposed_satellite_b_mm: 60, proposed_satellite_long_mm: 90}

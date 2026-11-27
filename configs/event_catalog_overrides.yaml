@@ -1,0 +1,80 @@
+# Event-catalog overrides (user decisions 2026-11-20, REPORT_U1 §14). Read by
+# src/events/build_event_catalog.py and src/events/rain_validation.py. Silver records are never rewritten.
+version: 1
+
+# Silver records replaced by a corrected record written through the existing Silver writer.
+# The old row stays in the catalog (one row per Silver record) with superseded_by set and usable_for = [].
+superseded:
+  fer_b101085e8c50fd10:
+    superseded_by: fer_297b4a659e6a8aee
+    reason: >-
+      Malformed JSON string at creation: the closing quote of evidence_locator was escaped, so the
+      extracted_text was swallowed into evidence_locator and the record failed the Silver validator.
+      Corrected record: same values, extracted_text restored verbatim (substring of the artifact).
+
+# Rain-validation duplicates (same gauge, same rain, reported by two sources): excluded from U1.4 statistics.
+rain_validation_duplicates:
+  fer_1a257569ecebb781:
+    duplicate_of: fer_6bec68772a4ff8da
+    reason: "Hoang Mai 105 mm 'within six hours' = Hoang Mai District 105 mm 'from midnight to 6 a.m.' (28/09/2023)"
+  # U1.1b (2026-11-20): SGGP 26/8/2025 'trong vòng 24 giờ qua' repeats the VnExpress 27/8 gauges and values
+  fer_72f7d4655a251773: {duplicate_of: fer_fba62e3b0b45c7c7, reason: "Hai Bà Trưng 'trên 461mm' (SGGP) = 460 mm noon-to-noon (VnExpress)"}
+  fer_9db4494eefb0eef6: {duplicate_of: fer_79ce0a3a30b1928c, reason: "Yên Sở 368 mm, same value in SGGP and VnExpress"}
+  fer_f33ca86662cf59ef: {duplicate_of: fer_cd62f6b95fab2627, reason: "Tây Mỗ 352 mm, same value in SGGP and VnExpress"}
+  fer_358a81a59ab20577: {duplicate_of: fer_a28b093d9c8fc585, reason: "Yên Nghĩa 334 mm, same value in SGGP and VnExpress"}
+  fer_bffacbc5ffeb0638: {duplicate_of: fer_4e144f599da0eb1b, reason: "Ô Chợ Dừa 323 mm, same value in SGGP and VnExpress"}
+  # U1-R2b (user 2026-11-23, D201): duplicate_of only for the same station, the same stated period and the same
+  # value (difference <= 1 %). Of the 5 entries added by U1-R2 only Tây Mỗ 169 mm meets this; the other 4
+  # (510/527.2, 420/407.7, 352/170.5, 562/223.9) were removed and go through normal classification.
+  fer_363616330a811a6f: {duplicate_of: fer_1cdd1065ef7cb3a5, reason: "Tây Mỗ 169 mm 29/9 07:00–30/9 07:00; Tuổi Trẻ (max) = Znews (eq), same value"}
+
+# Period-basis overrides for U1.4 (all excluded from the primary set; kept as sensitivity blocks).
+period_basis:
+  end_only_unknown_start:
+    reason: >-
+      Only the end (or the time of the statement) is known, the start of the accumulation is not stated.
+      VnExpress 07/10/2025 '8h30 ngày 07/10' = time of the KTTV statement (REPORT_U1 §13.3); Thanh Tra 26/8/2025
+      'đến 6h30 sáng nay' (start 'từ đêm 25'); Nhân Dân 14/9/2023 'tính đến thời điểm 12 giờ ngày 14/9'.
+    records: [fer_021ba7ccb9a794a1, fer_c03f6b2ab1925520, fer_44c9f803070f8e74, fer_a043ef443a589f8e,
+              fer_af3cc636b9313641, fer_c7d25031ebde484a,
+              fer_4b39851ebc281514, fer_7e8930a2aca675f7,
+              fer_5bb4fd7fe5c1e9b5, fer_9f03db259cb1df21, fer_870d481d34d9ed5c, fer_99ef71a872441b0b,
+              fer_65e4233952270be9, fer_8dca043a03e3c03e, fer_42b4f9c05222082b, fer_465925edf02d491a,
+              fer_010ae9006526f096, fer_a435e4ca3b3b4aaf, fer_8bcae5b1638adbb6, fer_73a0d6dedc1589e0,
+              fer_efcfc7e999dc5d00, fer_98fa33cfe464e19e, fer_70045037ef9dbd2a, fer_999aa2d9678ff25b]
+  stated_but_doubtful:
+    reason: >-
+      User 2026-11-20: VnExpress 7/10/2025 'Riêng khung giờ 6h-8h' (Từ Liêm 240 mm …) is recorded verbatim but
+      conflicts with other sources (Nhân Dân: Từ Liêm 176,1mm for 0h10-6h30; earlier VnExpress '8h30' statement).
+    records: [fer_68e45a99e79f3a86, fer_f7cfd2d719c8f2d7, fer_6c0067c68790c2a1, fer_dd3bd5919ce74e98,
+              fer_42798e77be2f0243, fer_e2e1bf498a06a108]
+  start_only_unknown_end:
+    reason: "VietNamNet live blog 7/10/2025: Drainage Co totals 'từ 0h10 đêm 7/10', end of the period not stated."
+    records: [fer_1f36e2eff4ba1566, fer_c682c8ed329f95d7, fer_db8e8c183fade168, fer_4c01b2155f32ebf3]
+  duration_only_unknown_end:
+    reason: "Đại biểu Nhân dân 7/10/2025: 'Lượng mưa 6h qua', the end of the 6 hours is not stated."
+    records: [fer_1c104b823985cacb, fer_fdf8487b50eaca55]
+
+# U1-AI2 (user 2026-11-26, D208): records whose start time is stated in the article text (possibly approximate,
+# or as the onset of rain in another sentence) keep period_basis clock (they stay in the U1.4 primary set) and
+# carry this warning. Documentation only: no code reads this block, period windows are unchanged.
+period_basis_warnings:
+  approximate start stated in text:
+    records:
+      fer_5a5c8459139a99d0: >-
+        SGGP 12/5/2024: start 'Từ khoảng 17 giờ 30 cùng ngày, Hà Nội bắt đầu có mưa to đến rất to'; end
+        'cập nhật số liệu đến 19 giờ 30 ngày 12-5' → 17:30–19:30 local (start approximate, onset of rain).
+      fer_687d1ec8c3d1dac4: >-
+        Nhân Dân 7/10/2025: start 'từ 0 giờ 10 phút đến nay, trên địa bàn thành phố Hà Nội có mưa diện rộng'
+        (article lead); end 'tính đến 6 giờ 30 phút sáng nay (7/10)' → 00:10–06:30 local (start = onset of rain
+        stated in another sentence than the gauge values).
+
+# Explicit accumulation windows (local time) where the text states the period with part-of-day words.
+# These records stay in the primary set (decision D125): '24 giờ từ trưa 25/8 đến trưa 26/8' -> 12:00 to 12:00.
+period_windows:
+  noon_to_noon_24h:
+    start_local: "2025-08-25 12:00"
+    end_local: "2025-08-26 12:00"
+    reason: "VnExpress 27/8/2025: 'trong 24 giờ từ trưa 25/8 đến trưa 26/8'; 'trưa' taken as 12:00 (±1 h on 24 h)"
+    records: [fer_fba62e3b0b45c7c7, fer_79ce0a3a30b1928c, fer_cd62f6b95fab2627, fer_a28b093d9c8fc585,
+              fer_4e144f599da0eb1b]

@@ -1,0 +1,13 @@
+# Administrative-name aliases for the event catalog (src/events/build_event_catalog.py).
+# Exact-name aliases only: an alias applies when the location name in the text, after removing the
+# unit word ("phường", "xã", …) and the trailing ", Hà Nội", equals `text_name` EXACTLY (tone marks kept,
+# case-insensitive). No fuzzy matching, no partial matching. Only user-approved entries belong here.
+version: 1
+aliases:
+  - text_name: "Văn Miếu"
+    osm_name: "Văn Miếu - Quốc Tử Giám"
+    level: ward
+    era: current          # post-2025-07-01 ward
+    approved_by: user
+    approved: 2026-11-20
+    note: "Đại Đoàn Kết 30/9/2025 lists 'Văn Miếu 277 mm'; OSM name 'Phường Văn Miếu - Quốc Tử Giám'"
