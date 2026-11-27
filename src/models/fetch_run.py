@@ -32,8 +32,10 @@ if str(ROOT) not in sys.path:
 from src.models import cloud_train as CT  # noqa: E402
 from src.realtime import common as C  # noqa: E402
 
-MIRROR_ONLY_JOBS = ("p4b_smoke", "p4b_post", "p4d", "p4d_smoke", "p4e_smoke")   # outputs stay in the mirror; never installed (D101)
+MIRROR_ONLY_JOBS = ("p4b_smoke", "p4b_post", "p4d", "p4d_smoke", "p4e_smoke", "p4fg_smoke", "p4fg", "nwpconv_backfill")   # outputs stay in the mirror; never installed (D101)
 INSTALL_PREFIXES = ("models/", "data/gold/met_training/pilot_v0/preds/", "reports/p4a/runs/")
+# P4F/P4G: p4fg_final installs only the v2 candidate models (models/v1/ and everything else stay untouched)
+JOB_INSTALL_PREFIXES = {"p4fg_final": ("models/v2_candidate/",)}
 
 
 def _sha(b: bytes) -> str:
@@ -63,7 +65,7 @@ def fetch(store, job: str, run_id: str, dest: Path) -> dict:
         if not rel_run.startswith("files/"):
             continue
         rel = rel_run[len("files/"):]
-        if job in MIRROR_ONLY_JOBS or not rel.startswith(INSTALL_PREFIXES) or ".." in rel.split("/"):
+        if job in MIRROR_ONLY_JOBS or not rel.startswith(JOB_INSTALL_PREFIXES.get(job, INSTALL_PREFIXES))                 or ".." in rel.split("/"):
             continue
         dst = dest / rel
         if dst.is_file():
@@ -115,24 +117,24 @@ def verify(mirror: Path, job: str, run_id: str) -> dict:
     return out
 
 
-def copy_figs(dest: Path, job: str, run_id: str) -> list[str]:
+def copy_figs(dest: Path, job: str, run_id: str, phase: str = "p4e") -> list[str]:
     """p4e (D196): copy the cloud figures of the mirror (files/reports/p4e/figs/) to reports/p4e/figs/<job>_<run_id>/
     (new folder per run; an existing file with other bytes is never overwritten: error)."""
-    src = dest / "reports" / job / "cloud" / run_id / "files" / "reports" / "p4e" / "figs"
-    out = dest / "reports" / "p4e" / "figs" / f"{job}_{run_id}"
+    src = dest / "reports" / job / "cloud" / run_id / "files" / "reports" / phase / "figs"
+    out = dest / "reports" / phase / "figs" / f"{job}_{run_id}"
     done = []
     if not src.is_dir():
         return done
-    for f in sorted(src.iterdir()):
+    for f in sorted(src.rglob("*")):
         if not f.is_file():
             continue
-        t = out / f.name
+        t = out / f.relative_to(src)
         b = f.read_bytes()
         if t.is_file():
             if t.read_bytes() != b:
                 raise RuntimeError(f"{t} exists with other bytes; not overwritten")
         else:
-            out.mkdir(parents=True, exist_ok=True)
+            t.parent.mkdir(parents=True, exist_ok=True)
             t.write_bytes(b)
         done.append(t.relative_to(dest).as_posix())
     return done
@@ -151,8 +153,9 @@ def main(argv=None) -> int:
     log = fetch(store, a.job, run_id, Path(a.dest_root) if a.dest_root else ROOT)
     C.log("fetched", job=a.job, run_id=run_id, objects=log["objects"], bytes=log["bytes"],
           installed=len(log["installed"]), identical=log["identical"], archived=len(log["archived"]))
-    if a.job.startswith("p4e"):
-        figs = copy_figs(Path(a.dest_root) if a.dest_root else ROOT, a.job, run_id)
+    if a.job.startswith(("p4e", "p4fg_smoke")) or a.job == "p4fg":
+        figs = copy_figs(Path(a.dest_root) if a.dest_root else ROOT, a.job, run_id,
+                         "p4e" if a.job.startswith("p4e") else "p4fg")
         C.log("figs_copied", job=a.job, run_id=run_id, files=len(figs))
     if a.verify:
         dest = Path(a.dest_root) if a.dest_root else ROOT

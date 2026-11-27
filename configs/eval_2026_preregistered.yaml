@@ -1,0 +1,41 @@
+# P4F.5 — pre-registration of the 2026 retrospective evaluation (TASK_P4F_P4G_FINAL_MODEL.md).
+# Written 2026-11-27, BEFORE any 2026 data exists locally (none is downloaded in P4F/P4G). DECISIONS D215 records the
+# sha256 of json.dumps(<this file parsed>, sort_keys=True). Any change after 2026 data is seen: stop and ask.
+# Not a flood model; labels are IMERG (satellite estimate), not rain gauges.
+version: "eval-2026-v1"
+period_utc: ["2026-05-01", "2026-10-31"]
+
+inputs:
+  gsmap_now: "JAXA archive /now/netcdf (when it is back), same collector, same regional crop and Silver code"
+  nwp: "Open-Meteo Previous Runs API, *_previous_day1 (set B; + convective variables only if Model 2 uses them)"
+
+version_check_first:                   # before ANY model evaluation
+  rule: "if the archived 2026 GSMaP NOW is product version V9 (not V8): stop and report a V8-vs-V9 bias analysis on the
+    overlap period (same pixels, same half-hour slots, rate ratio and wet-quantile ratios) before any model evaluation"
+  expected_version: V8
+
+labels:
+  primary: imerg_late_v07              # available within days
+  secondary: imerg_final_v07           # reported separately when available, never mixed with Late in one number
+  gaps: "report coverage per month; evaluate only (pixel, t0) where every model and the label exist"
+
+models:
+  official: v1                         # models/v1 (P4B), unchanged
+  candidate: model2                    # models/v2_candidate/<Model 2>/ (P4F.1 final fit)
+  baseline: persistence
+
+evaluation:
+  pixels: city                         # 47 city pixels, never cut, never downsampled, never weighted
+  frames: [0, 30, 60]
+  thresholds_mm_h: [2.5, 7.6]          # 7.6 descriptive only
+  bootstrap: {block: local_day, resamples: 1000, ci_level: 0.90, seed: 42}
+  cut: "each model's own pre-fixed cut (v1: models/v1 meta; Model 2: models/v2_candidate meta), never re-chosen on 2026"
+
+replacement_rule:                      # pre-registered: the candidate replaces v1 only if ALL hold at 2.5 mm/h
+  threshold_mm_h: 2.5
+  every_frame:
+    logloss_diff_ci90_upper_max: 0.0   # upper 90 % CI of (candidate - v1) log-loss <= 0
+    csi_diff_ci90_lower_min: -0.005    # lower 90 % CI of (candidate - v1) CSI >= -0.005
+    bss_min_exclusive: 0.0             # candidate BSS (vs climatology) > 0
+  heavy_7p6: descriptive_only
+  otherwise: "v1 stays the official model"

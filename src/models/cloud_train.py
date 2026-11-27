@@ -50,17 +50,30 @@ from src.realtime import common as C  # noqa: E402
 
 LAKE = "lake/v1/"
 RUNS = LAKE + "runs/"
-JOBS = ("p4a6", "p4a7", "p4b", "p4b_smoke", "p4b_post", "p4d", "p4d_smoke", "p4e_smoke", "p4e")
+JOBS = ("p4a6", "p4a7", "p4b", "p4b_smoke", "p4b_post", "p4d", "p4d_smoke", "p4e_smoke", "p4e", "p4fg_smoke", "p4fg",
+        "p4fg_final", "nwpconv_backfill")
 P4B_JOBS = ("p4b", "p4b_smoke")
 POST_JOBS = ("p4b_post",)        # post-final outputs; reads a fixed p4b run, never trains (src/models/p4b_post.py)
 P4D_JOBS = ("p4d", "p4d_smoke")  # v2 candidates cut vs weight (src/models/p4d.py); no --final in this phase
 P4E_JOBS = ("p4e_smoke", "p4e")  # v2 challenger (src/models/p4e.py); p4e = P4E.2 + P4E.3 + P4E.4 + P4E.6 (D198)
+P4FG_JOBS = ("p4fg_smoke", "p4fg")   # final model round (src/models/p4fg.py, TASK_P4F_P4G); stops at COMPARE_DONE
+FINAL_JOBS = ("p4fg_final",)          # P4F.1 final fit + P4F.6 REPLAY (src/models/p4fg_replay.py); needs SELECTION.json
+CONV_JOBS = ("nwpconv_backfill",)     # P4G.1 convective backfill (src/ingestion/openmeteo_conv_backfill.py)
+# extra R2 write prefixes per job (CLAUDE.md §8, approval P4F/P4G 2026-11-27); every key stays put-if-absent
+EXTRA_PREFIXES = {"p4fg_smoke": ("lake/v1/gold/met_training/table_v3",),
+                  "p4fg": ("lake/v1/gold/met_training/table_v3",),
+                  "p4fg_final": ("lake/v1/serving/replay/pkg=2026-11/",),
+                  "nwpconv_backfill": ("lake/v1/bronze/openmeteo_conv/", "lake/v1/silver/nwp_conv/")}
 SUMMARY_TITLE = {"p4a6": "PILOT v0", "p4a7": "PILOT v0", "p4b": "v1 (P4B)", "p4b_smoke": "v1 smoke (P4B, 2024 only)",
                  "p4b_post": "P4B post-final (no training, no test re-scoring)",
                  "p4d": "v2 candidates cut vs weight (P4D, LOSO OOF only)",
                  "p4d_smoke": "v2 smoke (P4D, short blocks, 2.5 mm/h only)",
                  "p4e_smoke": "v2 challenger smoke (D198: set B for 224 px, R-near, W-out, two-stage, figures)",
-                 "p4e": "v2 challenger (P4E.2-P4E.4 + P4E.6, LOSO OOF; stops at COMPARE_DONE, the hub decides)"}
+                 "p4e": "v2 challenger (P4E.2-P4E.4 + P4E.6, LOSO OOF; stops at COMPARE_DONE, the hub decides)",
+                 "p4fg_smoke": "final round smoke (P4F/P4G code paths; full Gold filtered to the smoke days, F30)",
+                 "p4fg": "final round (P4G.0-P4G.5, P4F.0 dt-check, P4F.2; LOSO OOF; stops at COMPARE_DONE)",
+                 "p4fg_final": "final fit + REPLAY (P4F.1, P4F.6; needs SELECTION.json of a p4fg run)",
+                 "nwpconv_backfill": "convective backfill (GFS CAPE / LI previous_day1, Open-Meteo Previous Runs API)"}
 GOLD_REL = "data/gold/met_training/pilot_v0/"
 CODE_FILES = ["src/models/cloud_train.py", "src/models/train_lgbm.py", "src/models/data.py", "src/models/metrics.py",
               "src/models/compare_A_B.py", "src/models/evaluate_lgbm.py", "src/gold/p4a_common.py",
@@ -148,6 +161,11 @@ def run_id_for(job: str) -> str:
     elif job in P4E_JOBS:
         from src.models import p4e as PE
         files = PE.CODE_FILES
+    elif job in P4FG_JOBS + FINAL_JOBS:
+        from src.models import p4fg as FG
+        files = FG.CODE_FILES
+    elif job in CONV_JOBS:
+        files = ["src/ingestion/openmeteo_conv_backfill.py", "src/models/cloud_train.py"]
     for f in files:
         h.update((ROOT / f).read_bytes().replace(b"\r\n", b"\n"))
     return h.hexdigest()[:12]
@@ -186,9 +204,14 @@ def open_run_store(spec: str, job: str):
     elif job in P4E_JOBS:                         # p4e: lake/v1/gold/met_training/table_v2*/ (CLAUDE.md §8, P4E)
         from src.models import p4e as PE
         second = PE.GOLD_REMOTE_PREFIX
+    elif job in EXTRA_PREFIXES:
+        second = EXTRA_PREFIXES[job][0]
     cfg = {"remote": {"realtime_prefix": f"{RUNS}{job}/", "status_prefix": second,
                       "overwritable_keys": [latest_key(job)], "bucket_env": "R2_BUCKET"}}
-    return C.open_store(spec, cfg)
+    st = C.open_store(spec, cfg)
+    if job in EXTRA_PREFIXES:                     # P4F/P4G: exactly the approved prefixes, nothing else
+        st.allowed = (f"{RUNS}{job}/",) + tuple(EXTRA_PREFIXES[job])
+    return st
 
 
 def done_units(store, job: str, run_id: str) -> set[str]:
@@ -761,8 +784,8 @@ def main(argv=None) -> int:
                          "contenders commit the same gate at the same instant (single-writer drill)")
     a = ap.parse_args(argv)
     t_start = time.time()
-    if a.race_drill and a.job not in ("p4b_smoke", "p4e_smoke"):
-        C.log("refused", reason="--race-drill applies to jobs p4b_smoke and p4e_smoke only")
+    if a.race_drill and a.job not in ("p4b_smoke", "p4e_smoke", "p4fg_smoke"):
+        C.log("refused", reason="--race-drill applies to jobs p4b_smoke, p4e_smoke and p4fg_smoke only")
         return 2
     if a.job in P4B_JOBS:
         return main_p4b(a, t_start)
@@ -772,6 +795,12 @@ def main(argv=None) -> int:
         return main_p4d(a, t_start)
     if a.job in P4E_JOBS:
         return main_p4e(a, t_start)
+    if a.job in P4FG_JOBS:
+        return main_p4fg(a, t_start)
+    if a.job in FINAL_JOBS:
+        return main_p4fg_final(a, t_start)
+    if a.job in CONV_JOBS:
+        return main_nwpconv(a, t_start)
     if a.final:
         C.log("final_refused", job=a.job, reason="--final applies to job p4b only")
         return 2
@@ -1191,6 +1220,223 @@ def main_p4e(a, t_start: float) -> int:
           compare_complete="compare-done" in done, skipped=len(res["skipped"]), yielded=len(res["yielded"]),
           lost=len(res["lost"]), output_mismatch=len(res["mismatch"]), race_drill=res.get("drill"),
           store=store.stats(), minutes=round((time.time() - t_start) / 60, 1))
+    return _exit_code(res)
+
+
+def main_p4fg(a, t_start: float) -> int:
+    """p4fg_smoke / p4fg (TASK_P4F_P4G): pre-registration hash check (D214), single-writer commits, LPT parts; phase 1
+    = opening gates + this part's opening and stage-3 work; phase 2 = hp-select + this part's stage-5 work (every part
+    waits for hp-select); phase 3 = closing gates (short wait). The winner of compare-done writes summary.json,
+    COMPARE_DONE.json and SELECTION.json (the marker p4fg_final needs)."""
+    import copy
+    import functools
+    from src.models import p4fg as FG
+    if a.final or a.write_oof_done or a.approve_final:
+        C.log("refused", job=a.job, reason="p4fg has no --final / --write-oof-done / --approve-final")
+        return 2
+    smoke = a.job == "p4fg_smoke"
+    cfg = FG.load_cfg(smoke=smoke)                      # raises if the pre-registered block changed (D214)
+    i, n = parse_part(a.part)
+    units = FG.units(cfg)
+    mine = FG.part_units(units, i, n, cfg)
+    gates = [u for u in units if u.kind == "gate"]
+    run_id = a.run_id or run_id_for(a.job)
+    store = open_run_store(a.store, a.job)
+    done = done_units(store, a.job, run_id)
+    est = FG.plan_estimate(cfg, units, n)
+    rec = FG.choose_parts(cfg, units)
+    C.log("plan", job=a.job, run_id=run_id, part=f"{i}/{n}", units_total=len(units), units_in_part=len(mine),
+          done=len(done), smoke=smoke, gold_id=FG.gold_id(cfg), conv_id=FG.conv_id(cfg), prereg_sha=FG.PREREG_SHA,
+          todo=[u.id for u in mine + gates if u.id not in done][:40], note=FG.NOT_FLOOD)
+    C.log("estimate", parts=n, part_minutes=est["part_minutes"], runner_minutes=est["runner_minutes"],
+          max_part_minutes=est["max_part_minutes"], within_target=est["within_target"], by_kind=est["by_kind"],
+          proposed_parts=rec["parts"], proposed_part_minutes=rec["part_minutes"],
+          proposed_runner_minutes=rec["runner_minutes"])
+    icv = FG.inner_cv_plan_check(cfg)
+    bad = [r for r in icv if not r["ok"]]
+    C.log("inner_cv_check", ok=not bad, cases=len(icv), failing=bad[:6])
+    if bad:
+        C.log("refused", job=a.job, reason="inner CV would have < 2 usable blocks")
+        return 2
+    if est["max_part_minutes"] > float(cfg["pre_registered"]["planning"]["part_hard_limit_minutes"]):
+        C.log("refused", job=a.job, reason=f"slowest part estimated at {est['max_part_minutes']} min > hard limit")
+        return 2
+    if a.plan:
+        return 0
+    ok, n0 = parts_lock(store, a.job, run_id, n)
+    if not ok:
+        C.log("refused", job=a.job, run_id=run_id, reason=f"this run is split into {n0} parts; got --part {i}/{n}")
+        return 2
+    mirror = ROOT / "cloud_out" / a.job / run_id
+    lk = latest_key(a.job)
+    body = {"job": a.job, "run_id": run_id}
+    if lk not in store.list(lk) or json.loads(store.get(lk)) != body:
+        store.put_json(lk, body, overwrite=True)
+    ctx = FG.Ctx(cfg, store, a.job, run_id, mirror, C.log)
+    rc = cfg["race"]
+    commit = functools.partial(commit_unit_single, stale_minutes=float(rc["claim_stale_minutes"]),
+                               poll_seconds=float(rc["claim_poll_seconds"]),
+                               scratch_kinds=tuple(rc["loser_scratch_kinds"]))
+    run = lambda u: FG.run_unit(u, ctx)                # noqa: E731
+    opening = [u for u in gates if u.stage <= FG.LAST_OPENING_STAGE]
+    mid = [u for u in gates if u.id in FG.MID_GATES]
+    closing = [u for u in gates if u.stage > FG.LAST_OPENING_STAGE and u.id not in FG.MID_GATES]
+    s5 = [u for u in mine if u.stage == FG.STAGE5]
+    res = drive(a, t_start, store, a.job, run_id, [u for u in mine if u.stage != FG.STAGE5] + opening, run, mirror,
+                commit=commit)
+    for allowed, short in ((mid + s5, False), (closing, True)):
+        a2 = copy.copy(a)
+        if short:
+            a2.wait_minutes = min(a.wait_minutes, float(rc["close_gate_wait_minutes"]))
+        r2 = drive(a2, t_start, store, a.job, run_id, allowed, run, mirror, commit=commit)
+        for k, v in r2.items():
+            if isinstance(v, list):
+                res[k] += v
+            else:
+                res[k].update(v)
+    if a.race_drill:
+        g = {u.id: u for u in gates}[FG.DRILL_GATE]
+        if g.id in done_units(store, a.job, run_id):
+            res["drill"] = race_drill_single(store, a.job, run_id, g, run, mirror)
+        else:
+            res["drill"] = {"ok": False, "reason": f"{g.id} not done yet in this run"}
+    done = done_units(store, a.job, run_id)
+    missing = [u.id for u in units if u.id not in done]
+    if "compare-done" in res["won"]:                   # single writer: only the winner of compare-done
+        pre = run_prefix(a.job, run_id)
+        mk = json.loads(store.get(marker_key(a.job, run_id, "compare-done")))
+        cs = ctx.read_json(f"{FG.OUT}/compare/compare_summary.json")
+        sel = ctx.read_json(f"{FG.OUT}/compare/selection.json")
+        hp = ctx.read_json(f"{FG.OUT}/compare/hp_select.json")
+        selection = {"job": a.job, "run_id": run_id, "smoke": smoke, "prereg_sha": FG.PREREG_SHA,
+                     "gold_id": FG.gold_id(cfg), "conv_id": FG.conv_id(cfg), "model2": sel["selection"]["model2"],
+                     "model2_specs": {str(k): v for k, v in sel["selection"]["model2_specs"].items()},
+                     "hp_select": hp["folds"], "dt_check": sel["dt_check"],
+                     "union_adopted_for_model2": sel["union_adopted_for_model2"],
+                     "compare_marker": marker_key(a.job, run_id, "compare-done"), "note": FG.NOT_FLOOD}
+        store.put_json(pre + "summary.json", {"job": a.job, "run_id": run_id, "stage": cs["stage"],
+                                              "metrics": mk.get("metrics"), "note": FG.NOT_FLOOD})
+        store.put_json(pre + "SELECTION.json", selection)
+        store.put_json(pre + "COMPARE_DONE.json", {"job": a.job, "run_id": run_id,
+                                                   "compare_marker": marker_key(a.job, run_id, "compare-done"),
+                                                   "note": "stop point S2/S3: the user decides"})
+    extra = [f"part {i}/{n}; gold {FG.gold_id(cfg)}; conv {FG.conv_id(cfg)}; estimate {est['part_minutes']} min",
+             FG.NOT_FLOOD, *_race_lines(res)]
+    write_step_summary(a.job, step_summary(a.job, run_id, res["won"], len(missing), res["metrics"] or None, extra))
+    C.log("end", job=a.job, run_id=run_id, part=f"{i}/{n}", finished_now=len(res["won"]), missing=len(missing),
+          compare_complete="compare-done" in done, skipped=len(res["skipped"]), yielded=len(res["yielded"]),
+          lost=len(res["lost"]), output_mismatch=len(res["mismatch"]), race_drill=res.get("drill"),
+          store=store.stats(), minutes=round((time.time() - t_start) / 60, 1))
+    return _exit_code(res)
+
+
+def main_p4fg_final(a, t_start: float) -> int:
+    """p4fg_final: refuses without the SELECTION.json of a finished (non-smoke) p4fg run; final fits, Model 2 LOSO at
+    0.5 (when Model 2 != Model 1-B), REPLAY events, publish to lake/v1/serving/replay/pkg=2026-11/ (put-if-absent,
+    re-download check). Work units of part i/n round robin."""
+    import functools
+    from src.models import p4fg as FG
+    from src.models import p4fg_replay as R
+    if a.final or a.write_oof_done or a.approve_final or a.race_drill:
+        C.log("refused", job=a.job, reason="p4fg_final has no --final / --write-oof-done / --race-drill")
+        return 2
+    cfg = FG.load_cfg(smoke=False)
+    store = open_run_store(a.store, a.job)
+    try:
+        sel = R.read_selection(store, cfg)
+    except RuntimeError as e:
+        C.log("refused", job=a.job, reason=str(e))
+        return 2
+    if sel.get("smoke"):
+        C.log("refused", job=a.job, reason="the selection marker comes from a smoke run")
+        return 2
+    i, n = parse_part(a.part)
+    units = R.final_units(cfg, sel)
+    work = sorted([u for u in units if u.kind != "gate"], key=lambda u: (u.stage, u.id))
+    mine = [u for k, u in enumerate(work) if k % n == i - 1]
+    run_id = a.run_id or run_id_for(a.job)
+    C.log("plan", job=a.job, run_id=run_id, part=f"{i}/{n}", source_run_id=sel["source_run_id"], model2=sel["model2"],
+          units_total=len(units), units_in_part=len(mine), note=FG.NOT_FLOOD)
+    if a.plan:
+        return 0
+    ok, n0 = parts_lock(store, a.job, run_id, n)
+    if not ok:
+        C.log("refused", job=a.job, run_id=run_id, reason=f"this run is split into {n0} parts; got --part {i}/{n}")
+        return 2
+    mirror = ROOT / "cloud_out" / a.job / run_id
+    ctx = FG.Ctx(cfg, store, a.job, run_id, mirror, C.log)
+    rc = cfg["race"]
+    commit = functools.partial(commit_unit_single, stale_minutes=float(rc["claim_stale_minutes"]),
+                               poll_seconds=float(rc["claim_poll_seconds"]),
+                               scratch_kinds=tuple(rc["loser_scratch_kinds"]))
+
+    def run(u):
+        with FG.env():
+            return R.run_final_unit(u, ctx)
+    gates = [u for u in units if u.kind == "gate"]
+    res = drive(a, t_start, store, a.job, run_id, mine + gates, run, mirror, commit=commit)
+    done = done_units(store, a.job, run_id)
+    missing = [u.id for u in units if u.id not in done]
+    if "final-done" in res["won"]:
+        store.put_json(run_prefix(a.job, run_id) + "summary.json",
+                       {"job": a.job, "run_id": run_id, "source_run_id": sel["source_run_id"], "model2": sel["model2"],
+                        "stage": "P4F.1 + P4F.6 complete (stop point S3)", "note": FG.NOT_FLOOD})
+    write_step_summary(a.job, step_summary(a.job, run_id, res["won"], len(missing), res["metrics"] or None,
+                                           [f"part {i}/{n}; source p4fg {sel['source_run_id']}", FG.NOT_FLOOD]))
+    C.log("end", job=a.job, run_id=run_id, part=f"{i}/{n}", finished_now=len(res["won"]), missing=len(missing),
+          store=store.stats(), minutes=round((time.time() - t_start) / 60, 1))
+    return _exit_code(res)
+
+
+def main_nwpconv(a, t_start: float) -> int:
+    """nwpconv_backfill: one part only (downloads strictly sequential); one unit per 13-day block (Bronze + Silver of
+    its days); resumable; HTTP 429 -> STOP_429.json under the run prefix, exit 4."""
+    from datetime import date
+    import requests
+    from src.ingestion import openmeteo_conv_backfill as OB
+    from src.models import p4b as PB
+    from src.models import p4fg as FG
+    if a.part != "1/1" or a.final or a.race_drill or a.write_oof_done:
+        C.log("refused", job=a.job, reason="nwpconv_backfill runs as one part (--part 1/1) without other options")
+        return 2
+    cfg = FG.load_cfg(smoke=False)
+    a0, b0 = (date.fromisoformat(x) for x in cfg["pre_registered"]["convective"]["period"])
+    blocks = OB.blocks(a0, b0, int(cfg["conv_store"]["block_days"]))
+    run_id = a.run_id or run_id_for(a.job)
+    store = open_run_store(a.store, a.job)
+    units, prev = [], ()
+    for x, y in blocks:
+        u = PB.Unit(f"block-{x}", "block", 1, prev, {"a": x, "b": y})
+        units.append(u)
+        prev = (u.id,)
+    C.log("plan", job=a.job, run_id=run_id, blocks=len(blocks), first=blocks[0], last=blocks[-1],
+          min_interval_s=cfg["conv_store"]["min_interval_s"], done=len(done_units(store, a.job, run_id)))
+    if a.plan:
+        return 0
+    pts = OB.points(store)
+    mirror = ROOT / "cloud_out" / a.job / run_id
+    state: dict = {}
+    out_rel = "reports/nwpconv"
+
+    def run(u):
+        r = OB.run_block(store, cfg, u.params["a"], u.params["b"], pts, requests.get, state)
+        p = ROOT / out_rel / f"{u.id}.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(r, indent=1), encoding="utf-8")
+        return [f"{out_rel}/{u.id}.json"], {"fetched": r["fetched"], "days": len(r["days"]),
+                                            "dq_fail": sum(not d["dq_pass"] for d in r["days"].values())}
+    try:
+        res = drive(a, t_start, store, a.job, run_id, units, run, mirror)
+    except OB.RateLimited as e:
+        store.put_json(run_prefix(a.job, run_id) + "STOP_429.json", {"utc": time.time(), "detail": str(e)[:300]})
+        C.log("stop_429", job=a.job, detail=str(e)[:200])
+        return 4
+    done = done_units(store, a.job, run_id)
+    missing = [u.id for u in units if u.id not in done]
+    write_step_summary(a.job, step_summary(a.job, run_id, res["won"], len(missing), None,
+                                           [f"{len(blocks)} blocks; Open-Meteo Previous Runs API (GFS CAPE / LI)"]))
+    C.log("end", job=a.job, run_id=run_id, finished_now=len(res["won"]), missing=len(missing), store=store.stats(),
+          minutes=round((time.time() - t_start) / 60, 1))
     return _exit_code(res)
 
 

@@ -27,6 +27,17 @@ TZ = "Asia/Ho_Chi_Minh"
 PERS = "persistence"
 COLORS = ["#1b6ca8", "#1b9e77", "#d95f02", "#7570b3", "#e7298a"]
 PERS_COLOR = "0.35"
+# P4F.3: display names (legend) and axis texts; empty = the P4E labels (callers fill them from their config)
+DISPLAY: dict = {}
+TEXT: dict = {}
+
+
+def _name(m: str) -> str:
+    return DISPLAY.get(m, m)
+
+
+def _tx(key: str, default: str) -> str:
+    return TEXT.get(key, default)
 
 
 def _plt():
@@ -87,7 +98,7 @@ def reliability(F: dict, models: list[str], thrs: list[float], leads: list[int],
                 d = r[r["n"] > 0]
                 ece = float((d["n"] * (d["mean_p"] - d["obs_freq"]).abs()).sum() / max(d["n"].sum(), 1))
                 a.plot(d["mean_p"], d["obs_freq"], marker="o", ms=3, lw=1.2, color=_color(models, m),
-                       label=f"{m} (ECE {ece:.4f})")
+                       label=f"{_name(m)} (ECE {ece:.4f})")
                 for _, x in r.iterrows():
                     rows.append({"threshold": t, "lead_min": L, "prob": kind, "model": m, **x.to_dict()})
                 ref = r if ref is None else ref
@@ -99,7 +110,8 @@ def reliability(F: dict, models: list[str], thrs: list[float], leads: list[int],
                 a.set_zorder(b.get_zorder() + 1); a.patch.set_visible(False)
             a.set_xlim(0, 1); a.set_ylim(0, 1)
             a.set_title(f">= {t:g} mm/h, F{L}, {'recalibrated (Platt)' if kind == 'cal' else 'raw'}", fontsize=9)
-            a.set_xlabel("forecast probability", fontsize=8); a.set_ylabel("observed frequency", fontsize=8)
+            a.set_xlabel(_tx("probability", "forecast probability"), fontsize=8)
+            a.set_ylabel(_tx("observed_frequency", "observed frequency"), fontsize=8)
             a.legend(fontsize=6, loc="upper left")
     fig.suptitle(f"{title} — reliability (pooled OOF, city pixels)\n{NOT_FLOOD}", fontsize=9)
     p = out / "reliability.png"
@@ -139,10 +151,12 @@ def scores_ci(F: dict, models: list[str], thrs: list[float], leads: list[int], o
                     continue
                 x = np.arange(len(d)) + (q - (len(names) - 1) / 2) * 0.12
                 a.errorbar(x, d["value"], yerr=[d["value"] - d["lo"], d["hi"] - d["value"]], fmt="o", ms=4,
-                           capsize=3, color=_color(models, m), label=m)
+                           capsize=3, color=_color(models, m), label=_name(m))
                 a.set_xticks(np.arange(len(d)), [f"F{L}" for L in d["lead_min"]])
             a.set_title(f"{k.upper()} >= {t:g} mm/h (OOF cut; {int(level * 100)} % day-block CI)", fontsize=9)
             a.set_ylim(0, 1); a.grid(alpha=0.3)
+            if TEXT:
+                a.set_xlabel(_tx("frame", ""), fontsize=8); a.set_ylabel(k.upper(), fontsize=8)
             if i == 0 and jx == 0:
                 a.legend(fontsize=7)
     fig.suptitle(f"{title} — CSI / POD / FAR per frame\n{NOT_FLOOD}", fontsize=9)
@@ -229,12 +243,12 @@ def fss(F: dict, models: list[str], thrs: list[float], leads: list[int], out: Pa
                 if not len(d):
                     continue
                 c = _color(models, m)
-                a.plot(d["size"], d["fss"], marker="o", ms=4, lw=1.2, color=c, label=m)
+                a.plot(d["size"], d["fss"], marker="o", ms=4, lw=1.2, color=c, label=_name(m))
                 a.fill_between(d["size"], d["lo"], d["hi"], color=c, alpha=0.15, lw=0)
             a.set_xticks(sizes, [f"{s}x{s}" for s in sizes])
             a.set_ylim(0, 1); a.grid(alpha=0.3)
             a.set_title(f"FSS >= {t:g} mm/h, F{L}", fontsize=9)
-            a.set_xlabel("neighbourhood (pixels, truncated to the city mask)", fontsize=8)
+            a.set_xlabel(_tx("neighbourhood", "neighbourhood (pixels, truncated to the city mask)"), fontsize=8)
             if i == 0 and jx == 0:
                 a.legend(fontsize=7)
     fig.suptitle(f"{title} — Fractions Skill Score, 47-pixel city mask (5x5 windows often truncated)\n{NOT_FLOOD}",
@@ -274,10 +288,12 @@ def halfmonth_csi(F: dict, models: list[str], thrs: list[float], leads: list[int
                 if not len(d):
                     continue
                 a.plot(range(len(halves)), d.reindex(halves)["csi"], marker="o", ms=3, lw=1.1,
-                       color=_color(models, m), label=m)
+                       color=_color(models, m), label=_name(m))
             a.set_xticks(range(len(halves)), halves, rotation=60, fontsize=6)
             a.set_ylim(0, 1); a.grid(alpha=0.3)
             a.set_title(f"CSI >= {t:g} mm/h, F{L} (seasons pooled)", fontsize=9)
+            if TEXT:
+                a.set_ylabel(_tx("csi", "CSI"), fontsize=8)
             if i == 0 and jx == 0:
                 a.legend(fontsize=7)
     fig.suptitle(f"{title} — CSI per half-month (MM-1 = days 1-15, MM-2 = 16-end, UTC date of t0)\n{NOT_FLOOD}",
@@ -368,10 +384,11 @@ def diagnosis(F: dict, pair: list[str], thrs: list[float], leads: list[int], out
                 v = j.loc[sel, "p_cal"].to_numpy("float64")
                 if len(v):
                     a.hist(v, bins=edges, histtype="step", lw=1.4, color=_color(pair, m),
-                           label=f"{m} (n {len(v)}, median {np.median(v):.2f})")
+                           label=f"{_name(m)} (n {len(v)}, median {np.median(v):.2f})")
             a.set_xlim(0, 1)
             a.set_title(f"P(>={t:g}) recalibrated where label >= {label_min:g}, F{L}", fontsize=9)
-            a.set_xlabel("probability", fontsize=8); a.set_ylabel("rows (city pixel x t0)", fontsize=8)
+            a.set_xlabel(_tx("probability", "probability"), fontsize=8)
+            a.set_ylabel(_tx("rows", "rows (city pixel x t0)"), fontsize=8)
             a.legend(fontsize=7)
     fig.suptitle(f"{title} — P4E.2 diagnosis, city pixels with IMERG label >= {label_min:g} mm/h (descriptive only)"
                  f"\n{NOT_FLOOD}", fontsize=9)

@@ -1,0 +1,192 @@
+# Phase 4F + 4G — final model round (docs/agent_runs/TASK_P4F_P4G_FINAL_MODEL.md). Not a flood model; labels are
+# IMERG (satellite estimate), not rain gauges. v1 stays the official model until the 2026 retrospective evaluation;
+# nothing here goes to live serving (the web demo uses the REPLAY package).
+#
+# Loaded by src/models/p4fg.py: configs/model_p4e.yaml through p4e.load_cfg (its D189 pre-registration hash is checked,
+# so frames, targets, features, Gold table_v2 gid a4a6329bcf13 and the set-B NWP columns of P4E are inherited
+# unchanged and reused), then this file on top. p4e `fits`, `two_stage`, `downsampling` and `diagnostics` are not used.
+#
+# PRE-REGISTERED: every number under `pre_registered` is written to DECISIONS D214 with the sha256 of
+# json.dumps(pre_registered, sort_keys=True) BEFORE any P4FG training code or result exists. p4fg.load_cfg() refuses to
+# run if that hash changes. A pre-registered number that needs to change after a result exists: stop and ask.
+version: "v2-p4fg"
+base_config: configs/model_p4e.yaml
+
+pre_registered:
+  dt_check:                           # P4F.0 verdict on the cloud unit dt-check (pooled GC / IMERG Final, code Δt)
+    ok_ratio: [0.6, 1.5]              # OK: code Δt = 0.5 h for the 30-min cadence AND pooled ratio in [0.6, 1.5]
+    bug_ratio: [1.7, 2.5]             # Δt bug: ratio in [1.7, 2.5] (or code Δt = 1 h on 30-min files) -> STOP
+    else: NEEDS_REVIEW                # anything else -> NEEDS_REVIEW, stop
+    pixels: city                      # 47 city pixels
+    periods: [["2024-05-01", "2024-10-31"], ["2025-05-01", "2025-09-30"]]   # UTC days, IMERG Final labels
+    same_slots: true                  # only half-hour slots where GC, raw and IMERG Final all exist at the pixel
+    gsmap_slot_rule: "slot [t, t+30) = 0.25 * (r(window t-30) + r(window t)) mm (code Δt 0.5 h per 30-min file)"
+
+  folds: [2024, 2025]                 # LOSO; set B history starts 2024-05; 2025-10 (IMERG Late) reported apart
+  evaluation_pixels: city             # 47 pixels, never cut, never downsampled, never weighted
+  thresholds_mm_h: {primary: 2.5, heavy: 7.6, auxiliary: 0.5}
+  bootstrap: {block: local_day, resamples: 1000, ci_level: 0.90}
+
+  base_model:                         # decision 3: Model 1-B of P4E run ae8fd71879ba, retrained in this run = B0
+    spec: b15x500                     # M0 + 177-pixel ring, set B (GSMaP + NWP previous_day1), LightGBM g1
+    lightgbm: {learning_rate: 0.06, num_leaves: 15, min_data_in_leaf: 500}
+    max_rounds: 1500
+    early_stopping_rounds: 75
+    probabilities: platt_crossfit_as_p4e   # same code path as P4E: p_raw stored, Platt fitted on the inner OOF
+    heavy_rule: nested                     #   (cross-fit), cut on the recalibrated inner OOF; 7.6 nested with 2.5
+
+  hp_grid:                            # P4G.3, nested inside each LOSO fold
+    num_leaves: [15, 31, 63]
+    min_data_in_leaf: [200, 500, 2000]
+    fixed: "other g1 settings, learning_rate 0.06, max_rounds 1500, early_stopping 75 (never changed)"
+    select_per: fold                  # one setting per LOSO fold, used at every frame and threshold of that fold
+    select_metric: "inner-OOF log-loss of the raw probabilities at 2.5 mm/h (city rows of the fold's own inner CV,
+      calendar-month blocks), summed over F0/F30/F60 as sum(n x mean log-loss); lowest wins; tie (|diff| < 1e-9) ->
+      fewer leaves, then larger min_data_in_leaf"
+    report_rounds_share_above: 0.60   # chosen rounds > 0.6 x max_rounds: reported, N_max not changed
+
+  convective:                         # P4G.1 (probe positive: reports/p4fg/conv_probe.json)
+    api: previous-runs-api.open-meteo.com/v1/forecast    # never the Historical Forecast API (decision 7)
+    model: gfs_global                 # ECMWF IFS 0.25 returned no convective variable
+    variables: [cape_previous_day1, lifted_index_previous_day1]   # CIN and TCWV: all null -> not available
+    points: set_b_81                  # the 81 Open-Meteo points of set B
+    period: ["2024-05-01", "2025-10-31"]
+    issue_rule: "forecast_issue_time = floor_6h(T) - 24 h for the time label T (as precipitation_previous_day1, P2A.2)"
+    available_rule: "available_time = forecast_issue_time + 420 min (configs/openmeteo_availability.yaml gfs_global)"
+    admissible: "forecast_issue_time <= prediction_time - 22 h AND available_time <= prediction_time"
+    value_hour: "T = floor_1h(frame_start) (instantaneous value of the hour containing the frame start)"
+    features:
+      g_a: [nwp_conv_gfs_cape_near, nwp_conv_gfs_cape_m03, nwp_conv_gfs_li_near, nwp_conv_gfs_li_m03]
+      g_b: dropped                    # TCWV / dTCWV not available from the Previous Runs API
+      g_c: [nwp_conv_gfs_cape_x_rain] # cape_near x [latest admissible GSMaP GC at the pixel >= 0.5 mm/h]
+    g2_violations_max: 0              # on every fold and month, else stop
+
+  selection:                          # P4G.5 composition rule; fixed order, each step on top of the current model
+    order: [hp_tuned, conv_g_a, conv_g_b, conv_g_c]   # conv_g_b dropped (not available)
+    accept_all:
+      pooled_logloss_2p5_ci90_upper_lt: 0.0           # (new - current), day sums pooled over the three frames
+      every_frame_logloss_2p5_ci90_upper_max: 0.0005
+      every_frame_csi_2p5_ci90_lower_min: -0.005
+      every_frame_pod_7p6_diff_min: -0.02             # point estimates, pooled OOF (nested 7.6 alarm)
+      every_frame_csi_7p6_diff_min: -0.01
+    model2_if_none_accepted: b15x500  # Model 2 = Model 1-B
+    never_used: [event tables, Matmo, 2026 data, P4B.6 test results]
+    shadow_gate: p4e                  # P4E shadow gate (pre-registered D189) applied to Model 2 vs v1 (B), reported
+
+  union_rule:                         # P4G.4, 7.6 mm/h, F30 and F60, binary display only (probabilities unchanged)
+    persistence: "base column pers (as every P4 report: latest admissible GSMaP GC for F0/F30, max of the k0-k2
+      windows for F60) >= 7.6"
+    union: "model nested 7.6 alarm OR persistence"
+    adopt_all_frames: [30, 60]
+    csi_diff_ci90_lower_min: 0.0      # union - model-only
+    csi_diff_point_gt: 0.0
+    bias_max: 2.0
+
+  regional:                           # P4G.2, experiment only (decision 8: the web keeps the pixel tier)
+    label: "1 if any pixel of the 3x3 neighbourhood (city + ring label grid) has frame-mean IMERG >= thr"
+    thresholds: [2.5, 7.6]
+    features: model_1b                # Model 1-B features and settings, LOSO, trained on city + ring rows
+    persistence: "1 if the persistence value (pers rule above) >= thr at any pixel of the 3x3 neighbourhood"
+    climatology: "training-fold mean of the regional label by local month x local hour (city rows), as P4B clim"
+    skill_frames: [30, 60]
+    bss_clim_ci90_excludes_zero_and_positive: true
+    bss_diff_vs_persistence_ci90_excludes_zero_and_positive: true
+
+  oracle:                             # P4G.0, deliberately leaky diagnostic, never served
+    target_frame_value: "mean GSMaP rate of the target frame [t0+lead, t0+lead+30): 0.5 * (r(window s-30) + r(window
+      s)), s = frame start, ignoring availability"
+    features: [oracle_gc_target, oracle_raw_target, oracle_gc_target_nb3, oracle_raw_target_nb3]
+    a_cut_oof: "GC / raw threshold chosen on the other fold for max CSI (candidates 0.1..40 mm/h), applied to the
+      held-out fold"
+
+  final_fit:                          # P4F.1
+    data: [["2024-05-01", "2024-10-31"], ["2025-05-01", "2025-09-30"]]   # IMERG Final; 2025-10 excluded (Matmo)
+    rounds: "median of the LOSO fits' median_rounds for the same model, frame and threshold (round half up)"
+    setting_if_folds_differ: "lowest inner-OOF log-loss (raw, 2.5, frames summed) summed over the two LOSO folds"
+    models: [model2, b15x500]
+
+  replay:                             # P4F.6
+    wettest_test_days: "3 local days (Asia/Ho_Chi_Minh) of 2025-05..09 with the highest mean IMERG Final label over
+      the 47 city pixels and all t0 of the day at F0, role eval, fold 2025; 2025-09-30 excluded; ties -> earlier day"
+    yagi: ["2024-09-06", "2024-09-08"]
+    wet_test_day: "2025-09-30"
+    matmo: ["2025-10-06", "2025-10-07"]
+    ring_chebyshev_max: 2
+    display_heavy_rule: union_if_adopted_else_model
+
+  planning:                           # decision 4
+    part_target_minutes: 250
+    part_hard_limit_minutes: 320
+    job_limit_minutes: 350
+    smoke_before_every_full_run: true
+
+# ------------------------------------------------------------------------------------------- not pre-registered
+display_names:                        # P4F.3: one mapping for every figure (legends) and table
+  v1: "v1 (chính thức)"
+  v1B: "v1 (chính thức)"
+  m1b: "Model 1-B"
+  Model1-B: "Model 1-B"
+  tuned: "Model 1-B tinh chỉnh"
+  m2: "Model 2 (ứng viên)"
+  persistence: "Persistence"
+  pers: "Persistence"
+  oracle_a_gc: "Oracle A GC (chẩn đoán, không phục vụ)"
+  oracle_a_raw: "Oracle A raw (chẩn đoán, không phục vụ)"
+  oracle_b: "Oracle B (chẩn đoán, không phục vụ)"
+  regional: "Mục tiêu vùng 3×3 (thí nghiệm)"
+  Model1-A: "Model 1 (bộ A)"
+  M0: "M0"
+  Model1: "Model 1"
+  conv_g_a: "+ CAPE/LI"
+  conv_g_c: "+ CAPE × mưa"
+axis_labels:                          # Vietnamese axis labels with units
+  probability: "Xác suất dự báo"
+  observed_frequency: "Tần suất quan sát"
+  neighbourhood: "Kích thước lân cận (pixel 0,1°, cắt theo mặt nạ thành phố)"
+  rows: "Số dòng (pixel × t0)"
+  frame: "Khung dự báo (phút)"
+  csi: "CSI"
+  rate: "Cường độ mưa (mm/h)"
+
+lightgbm:
+  learning_rate: 0.06
+
+inner_cv:
+  max_rounds: 1500
+  early_stopping_rounds: 75
+
+r2_budget:
+  max_total_gb: 6.0
+  projected_gold_gb: 0.05             # conv columns (table_v3_conv): 12 months x ~1 M rows x 5 float32
+  projected_run_gb: 0.80              # ~230 OOF parquets + oracle series + base + tables
+
+sources:                              # read-only inputs of the gates (R2)
+  p4b_run: {job: p4b, run_id: c0df12477947}       # P4F.2: row-level v1 predictions (OOF cv-*, final/preds)
+  p4e_run: {job: p4e, run_id: ae8fd71879ba}       # P4F.3: P4E figures re-rendered with the display names
+
+conv_store:
+  bronze_prefix: lake/v1/bronze/openmeteo_conv/
+  silver_prefix: lake/v1/silver/nwp_conv/
+  gold_prefix: lake/v1/gold/met_training/table_v3_conv/
+  block_days: 13                      # one request per block for all 81 points (+1 day for the last label)
+  min_interval_s: 180
+  retry_wait_s: 60
+  build_version: p4fg-conv-1
+
+smoke:                                # p4fg_smoke: every code path of p4fg, minutes; NOT a result
+  # The smoke REUSES the full Gold table_v2 (gid a4a6329bcf13) and the P4E set-B NWP columns: R2 writes of P4F/P4G are
+  # approved only under table_v3*/ (CLAUDE.md §8), so no smoke Gold may be built. Rows are filtered to `smoke_days` at
+  # load time; frames / targets / scope stay those of the full config (they define the gold id); the smoke selects
+  # its frame and thresholds with run_leads / run_thresholds.
+  # D184 smoke days + Yagi (2024-09-06..08): fold 2025 (set B trains on 2024 only) needs >= 7.6 rows in two UTC-day
+  # blocks for both thresholds (TASK smoke rule); 2025-10-06..07 = Matmo (IMERG Late, secondary).
+  smoke_days: [["2023-05-10", "2023-05-20"], ["2024-09-06", "2024-09-08"], ["2024-10-14", "2024-10-19"],
+               ["2025-07-01", "2025-07-06"], ["2025-10-06", "2025-10-07"]]
+  run_leads: [30]                     # one frame: F30 exercises the union rule, the oracle target frame and conv
+  run_thresholds: [2.5, 7.6]
+  folds: [2025]
+  evaluation: {bootstrap_resamples: 200, wettest_days: 3}
+  set_b: {inner_cv_block: utc_day}
+  hp_grid_points: [[15, 500], [31, 200]]   # B0 + one grid point
+  replay_smoke_day: "2025-07-03"      # one event day exported to lake/v1/runs/p4fg_smoke/ (never the serving prefix)
+  r2_budget: {projected_gold_gb: 0.01, projected_run_gb: 0.05}

@@ -212,3 +212,36 @@ Run `ae8fd71879ba`, Gold `a4a6329bcf13` (tái dùng), NWP `table_v2_nwp/gid=a4a6
 | Tổng | ≈ 953 phút runner; part chậm nhất ≤ 200 (= 0,8 × 250); `--max-minutes 320` giữ làm chặn |
 
 Dispatch 7 form `p4e` / `i/7` / `false` / `false` liền nhau. Part hết việc thì thoát; part chạy cuối làm gate kết. Nếu part nào hết giờ (`time_budget_reached`), dispatch lại đúng part đó (tiếp tục được). Sau run: agent `python -m src.models.fetch_run --job p4e --run-id ae8fd71879ba --verify`, rồi báo `compare/cost.csv` dự báo/thực tế (đơn vị lệch > 1,5× được đánh dấu).
+
+## P4FG — vòng mô hình cuối (TASK_P4F_P4G_FINAL_MODEL.md)
+
+Mọi job ghi R2 chỉ dưới tiền tố đã duyệt (CLAUDE.md §8, P4F/P4G): `runs/<job>/`, `gold/met_training/table_v3*/` (p4fg, p4fg_smoke), `bronze/openmeteo_conv/` + `silver/nwp_conv/` (nwpconv_backfill), `serving/replay/pkg=2026-11/` (p4fg_final). Khóa khác → `KeyRefused`. Gold `table_v2` (gid `a4a6329bcf13`) và NWP bộ B (`nid=e72f7fd94ad0`) chỉ được **dùng lại**; thiếu phân vùng → đơn vị lỗi, không dựng.
+
+### P4FG.1 Thứ tự dispatch sau S1 (form: job / part / final / race_drill)
+
+| # | Form | Khi nào | Ước lượng |
+|---|---|---|---|
+| 1 | `nwpconv_backfill` / `1/1` / `false` / `false` | ngay sau khi push | 43 khối × ≥ 180 s ≈ 130–150 phút, 1 runner (tải tuần tự; run `9900e8d4f8af`) |
+| 2 | `p4fg_smoke` / `1/2` / `false` / `true` | **sau khi #1 xanh** (smoke cần Silver `nwp_conv` của 2024-09, 2024-10, 2025-07, 2025-10) | ước ≈ 97 phút (hằng số bảo thủ; run `db0c4d8a01db`) |
+| 3 | `p4fg_smoke` / `2/2` / `false` / `true` | dispatch ngay sau #2 (< 1 phút) | ≈ 51 phút; tổng ước ≈ 148 phút runner |
+| 4 | (agent) `python -m src.models.fetch_run --job nwpconv_backfill --run-id 9900e8d4f8af --verify` và `python -m src.models.fetch_run --job p4fg_smoke --run-id db0c4d8a01db --verify` | sau khi #1–#3 xanh | cục bộ, chỉ đọc |
+
+Dòng log cần kiểm (bước **Train**):
+- `nwpconv_backfill`: `plan` (`blocks 43`, `first ["2024-05-01","2024-05-13"]`, `last [... "2025-10-31"]`); mỗi `unit_done block-…` có `fetched true` (lần đầu), `dq_fail 0`. Nếu thấy `stop_429` (exit 4): **dừng**, không chạy lại, báo agent. Chạy lại sau lỗi khác: tiếp tục từ khối chưa có Bronze.
+- `p4fg_smoke`: `plan` (`gold_id a4a6329bcf13`, `conv_id …`, `prereg_sha fbc7ec89…`); `feat-*`, `nwp-*` `reused true`; `conv-*` (`rows`, `nan_share_max`), `orc-*` (`oracle true`); `g2` (`conv_g2_violations 0`, `set_b_inner_cv_ok true`); `dtcheck` (`verdict`, `pooled_ratio`); `hp-select` (`chosen`); `cmp` (`model2`, `steps`, `union_adopted`, `dt_verdict`); `figs` (`p4e_relabel_ok`); `finalfit-smoke`, `replay-smoke` (`verified 3`); `race_drill_single` `ok true`; dòng `end` `lost 0`, `output_mismatch 0`.
+- Nếu `dtcheck` cho `verdict` khác `ok`: smoke vẫn chạy xong (ghi lại), nhưng agent **dừng ở S2** và báo (P4F.0).
+
+### P4FG.2 Job đầy đủ `p4fg` (CHỈ dispatch sau khi người dùng duyệt smoke; S2)
+
+Run `63baa3224b58` (đổi nếu mã đổi sau smoke). 297 đơn vị: 228 fit (B0 18, lưới 8 × 12, đối lưu trên B0 36, đối lưu trên mô hình tinh chỉnh 36 [alias khi fold chọn g1], oracle B 12, mục tiêu vùng 12, v1 (B) 18), 12 `conv`, 12 `orc`, 6 `base`, `dtcheck`, `fssv1`, 18 `feat` + 12 `nwp` (dùng lại), 7 gate. Gán part bằng LPT theo ước lượng (mọi part cùng n).
+
+| Phương án | Part | Part chậm nhất (ước) | Runner (ước) |
+|---|---|---|---|
+| đề xuất (0,8 × 250) | 10 | 199,7 phút | ≈ 1 148 phút |
+| tối thiểu (≤ 250) | 7 | 242,8 phút | ≈ 1 120 phút |
+
+Hằng số ước lượng = thời gian thực P4E × 1,5 (Model 1-B 109 s/fit, v1 (B) 23 s/fit) × hệ số lá; P4E thực tế bằng 0,61 × ước. Dispatch 10 form `p4fg` / `i/10` / `false` / `false` liền nhau. Part xong việc thì thoát; mọi part chờ `hp-select` (≤ 150 phút) trước các fit giai đoạn 5. Winner của `compare-done` ghi `SELECTION.json` + `COMPARE_DONE.json`. Sau run: agent `python -m src.models.fetch_run --job p4fg --run-id 63baa3224b58 --verify`.
+
+### P4FG.3 Job `p4fg_final` (sau chọn lựa; S3)
+
+Từ chối chạy khi chưa có `lake/v1/runs/p4fg/<run>/SELECTION.json` (run nguồn = `latest.json` của p4fg, hoặc `final_job.source_run_id` trong `configs/model_p4fg.yaml`), khi marker đến từ smoke, và không xuất REPLAY nếu phán quyết P4F.0 ≠ `ok`. Đơn vị: fit 0,5 LOSO của Model 2 (nếu khác Model 1-B), 9–18 final fit, 4 sự kiện REPLAY, `replay-publish` (put-if-absent dưới `serving/replay/pkg=2026-11/`, tải lại kiểm sha256, xoá tệp scratch), `final-done`. Form: `p4fg_final` / `1/1` / `false` / `false`. Mô hình chỉ cài cục bộ bằng `fetch_run` vào `models/v2_candidate/` (không bao giờ `models/v1/`).

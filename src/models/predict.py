@@ -293,9 +293,98 @@ def predict_v1(features: pd.DataFrame, mv: V1Version, nwp: pd.DataFrame | None =
 
 
 def load(version: str = "v1", **kw):
-    """Version switch: "v1" (default, P4B) or "v0" (PILOT, models/pilot_v0; same as load_version)."""
+    """Version switch: "v1" (default, P4B) or "v0" (PILOT, models/pilot_v0; same as load_version); "v2_candidate"
+    (P4F.1, models/v2_candidate/<model>/, NOT the official model; never used unless asked for explicitly)."""
     if version == "v1":
         return load_v1(**kw)
     if version == "v0":
         return load_version(**kw)
-    raise ValueError(f"unknown model version {version!r} (v1 or v0)")
+    if version == "v2_candidate":
+        return load_v2_candidate(**kw)
+    raise ValueError(f"unknown model version {version!r} (v1, v0 or v2_candidate)")
+
+
+# ------------------------------------------------------------------ v2 candidate (P4F.1), not the official model
+V2_DIR = ROOT / "models" / "v2_candidate"
+V2_MODELS = ("model2", "model1b")
+
+
+def _lgb_booster_text(path: Path):
+    """LightGBM booster from the model text (model_str): works on every platform and path (model_file aborts on some
+    Windows paths)."""
+    import lightgbm as lgb
+    return lgb.Booster(model_str=Path(path).read_text(encoding="utf-8"))
+
+
+@dataclass
+class V2Version:
+    name: str
+    model: str
+    run_id: str
+    leads: list[int]
+    thresholds: list[float]
+    models: dict = field(repr=False)         # (lead, thr) -> dict(booster, platt, cut, features, meta)
+
+
+def load_v2_candidate(model: str = "model2", root: Path | None = None, booster_loader=None) -> V2Version:
+    """Load the packaged final fits of one v2 candidate (models/v2_candidate/<model>/lead<L>_thr<t>/: model.txt,
+    meta.json). Every directory must agree with its meta.json and come from one run. v1 stays the official model."""
+    if model not in V2_MODELS:
+        raise ValueError(f"unknown v2 candidate {model!r} ({V2_MODELS})")
+    base = Path(root or V2_DIR) / model
+    load_b = booster_loader or _lgb_booster_text
+    models, run_ids = {}, set()
+    for d in sorted(base.glob("lead*_thr*")):
+        meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+        lead, thr = int(meta["lead_min"]), float(meta["threshold"])
+        if d.name != f"lead{lead}_thr{kstr(thr)}" or meta["model"] != model:
+            raise ValueError(f"meta.json does not match its directory: {d}")
+        if any("oracle" in c for c in meta["features"]):
+            raise ValueError(f"oracle feature in a served candidate: {d}")
+        models[(lead, thr)] = {"booster": load_b(d / "model.txt"), "platt": meta["platt"],
+                               "cut": float(meta["cut"]["cut"]), "features": list(meta["features"]), "meta": meta}
+        run_ids.add(meta["run_id"])
+    if not models:
+        raise FileNotFoundError(f"no v2 candidate model under {base}")
+    if len(run_ids) != 1:
+        raise ValueError(f"v2 candidate models come from mixed runs: {run_ids}")
+    leads = sorted({k[0] for k in models})
+    thrs = sorted({k[1] for k in models})
+    if set(models) != {(L, t) for L in leads for t in thrs}:
+        raise ValueError("v2 candidate: incomplete lead x threshold grid")
+    return V2Version(f"v2_candidate/{model}", model, run_ids.pop(), leads, thrs, models)
+
+
+def predict_v2_candidate(features: pd.DataFrame, mv: V2Version, leads: list[int] | None = None) -> pd.DataFrame:
+    """features: rows (pixel_id, t0, lead_min) carrying every model feature (Gold + set-B nwp_* + convective nwp_conv_*
+    columns as built by the cloud job). p_raw from the booster, p = Platt(p_raw), yhat = p >= cut; the 7.6 alarm also
+    needs the 2.5 alarm (nested); rain_class = highest alarm. Not a flood prediction."""
+    out = []
+    for lead in (leads or mv.leads):
+        f = features[features["lead_min"] == lead].reset_index(drop=True)
+        r = pd.DataFrame({"pixel_id": f["pixel_id"].to_numpy(), "t0": _utc(f["t0"]), "lead_min": np.int16(lead)})
+        cls = np.zeros(len(f), dtype="int8")
+        yh_by = {}
+        for ci, t in enumerate(mv.thresholds, start=1):
+            m = mv.models[(lead, t)]
+            missing = [c for c in m["features"] if c not in f.columns]
+            if missing:
+                raise KeyError(f"features missing for {mv.name} lead{lead} thr{t:g}: {missing[:5]}")
+            pr = np.asarray(m["booster"].predict(f[m["features"]].to_numpy("float32")), "float64")
+            pc = apply_calibration(m["platt"], pr)
+            yh = pc >= m["cut"]
+            if t == max(mv.thresholds) and V1_PRIMARY in yh_by:       # heavy: nested with the 2.5 alarm
+                yh &= yh_by[V1_PRIMARY]
+            yh_by[t] = yh
+            k = kstr(t)
+            r[f"p_raw_{k}"] = pr.astype("float32")
+            r[f"p_{k}"] = pc.astype("float32")
+            r[f"yhat_{k}"] = yh.astype("int8")
+            cls = np.where(yh, np.int8(ci), cls)
+        r["rain_class"] = cls
+        r["rain_class_name"] = pd.Series(cls).map(CLASS_NAMES).to_numpy()
+        out.append(r)
+    res = pd.concat(out, ignore_index=True)
+    res.attrs["model_version"] = f"{mv.name} ({mv.run_id}) — candidate, v1 stays official"
+    res.attrs["note"] = "Rain nowcasting against IMERG (satellite estimate, not gauges); not flood prediction."
+    return res
