@@ -689,26 +689,29 @@ def gate_figs(ctx) -> tuple[list[str], dict]:
         [rel(out_dir("figs") / "p4e_relabel_status.json")], {"png": len(paths), "p4e_relabel_ok": relabel["ok"]}
 
 
+P4E_OUT = "reports/p4e"            # folder of the stored P4E outputs (runs/p4e/<run>/files/reports/p4e/)
+
+
+@contextlib.contextmanager
+def p4e_out():
+    """Inside FG.env() the module global PE.OUT points at reports/p4fg; p4e.pooled -> p4d_env() copies PE.OUT into
+    PD.OUT, so the P4E reads must see P4E's own folder (S2 fix D218-1: the smoke relabel looked for
+    reports/p4fg/base/... under the P4E run and failed with FileNotFoundError)."""
+    old = PE.OUT
+    PE.OUT = P4E_OUT
+    try:
+        yield
+    finally:
+        PE.OUT = old
+
+
 def relabel_p4e(ctx, FGX, n, seed, lvl) -> tuple[list, dict]:
     """P4F.3: the P4E figures re-rendered from the stored P4E outputs (run sources.p4e_run, read only) with the display
     names; output under reports/p4fg/figs/p4e_relabel/."""
-    from src.models import p4e as PEm
-    src = ctx.cfg["sources"]["p4e_run"]
-    cfg_e = PEm.load_cfg(smoke=False)
-    cfg_e["evaluation"]["bootstrap_resamples"] = n
-    ce = PEm.Ctx(cfg_e, ctx.store, src["job"], src["run_id"], ctx.mirror, ctx.log)
-    fs = PEm.fig_spec(cfg_e)
-    thrs, Ls = [PEm.primary(cfg_e), PEm.heavy(cfg_e)], PEm.leads(cfg_e)
-    out = out_dir("figs", "p4e_relabel")
-    F = {}
-    for name, spec in fs["models"]:
-        for t in thrs:
-            if not PEm.has_fit(cfg_e, spec, t, fs["folds"]):
-                continue
-            for L in Ls:
-                j = PEm.pooled(ce, spec, L, t, ("eval",), fs["folds"])
-                F[(name, float(t), int(L))] = j[[c for c in PEm.FIG_COLS if c in j.columns]].copy()
+    with p4e_out():
+        F, fs, thrs, Ls, src, cfg_e = _p4e_frames(ctx, n)
     models = [m for m, _ in fs["models"]]
+    out = out_dir("figs", "p4e_relabel")
     paths, tables = [], {}
     title = f"P4E {src['run_id']} (vẽ lại, nhãn P4F.3)"
     p, tables["p4e_relabel_reliability"] = FGX.reliability(F, models, thrs, Ls, out, title,
@@ -719,6 +722,26 @@ def relabel_p4e(ctx, FGX, n, seed, lvl) -> tuple[list, dict]:
     p, tables["p4e_relabel_halfmonth_csi"] = FGX.halfmonth_csi(F, models, thrs, Ls, out, title)
     paths += p
     return paths, tables
+
+
+def _p4e_frames(ctx, n):
+    """Pooled eval frames of the P4E figure models, read from the stored P4E run (call inside p4e_out())."""
+    from src.models import p4e as PEm
+    src = ctx.cfg["sources"]["p4e_run"]
+    cfg_e = PEm.load_cfg(smoke=False)
+    cfg_e["evaluation"]["bootstrap_resamples"] = n
+    ce = PEm.Ctx(cfg_e, ctx.store, src["job"], src["run_id"], ctx.mirror, ctx.log)
+    fs = PEm.fig_spec(cfg_e)
+    thrs, Ls = [PEm.primary(cfg_e), PEm.heavy(cfg_e)], PEm.leads(cfg_e)
+    F = {}
+    for name, spec in fs["models"]:
+        for t in thrs:
+            if not PEm.has_fit(cfg_e, spec, t, fs["folds"]):
+                continue
+            for L in Ls:
+                j = PEm.pooled(ce, spec, L, t, ("eval",), fs["folds"])
+                F[(name, float(t), int(L))] = j[[c for c in PEm.FIG_COLS if c in j.columns]].copy()
+    return F, fs, thrs, Ls, src, cfg_e
 
 
 # ============================================================================ compare-done

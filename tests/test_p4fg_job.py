@@ -166,3 +166,40 @@ def test_display_names_cover_the_figures():
     assert dn["v1"] == "v1 (chính thức)" and dn["m1b"] == "Model 1-B" and dn["m2"] == "Model 2 (ứng viên)"
     assert dn["persistence"] == "Persistence" and "không phục vụ" in dn["oracle_b"]
     assert set(FULL["axis_labels"]) >= {"probability", "observed_frequency", "neighbourhood"}
+
+
+def test_relabel_p4e_reads_the_p4e_folder_inside_env(tmp_path, monkeypatch):
+    """S2 fix D218-1: inside FG.env() (PE.OUT = reports/p4fg) the P4E re-render must read reports/p4e/... of the P4E
+    run; the smoke failed with FileNotFoundError because p4d_env() copied reports/p4fg into PD.OUT."""
+    from types import SimpleNamespace
+    from src.models import p4d as PD
+    from src.models import p4e as PE
+    from src.models import p4fg_gates as G
+
+    class Stop(Exception):
+        pass
+    seen = []
+
+    def fake_base_rows(ctx, s, L):
+        seen.append((PD.OUT, ctx.job, ctx.run_id))
+        raise Stop
+    monkeypatch.setattr(PD, "base_rows", fake_base_rows)
+    cfg = FG.load_cfg(smoke=True)
+    ctx = SimpleNamespace(cfg=cfg, store=None, mirror=tmp_path, log=lambda *a, **k: None)
+    with FG.env():
+        with pytest.raises(Stop):
+            G.relabel_p4e(ctx, None, 10, 0, 0.9)
+        assert PE.OUT == FG.OUT and PD.OUT == FG.OUT                    # env() state restored after the P4E reads
+    src = cfg["sources"]["p4e_run"]
+    assert seen == [("reports/p4e", src["job"], src["run_id"])]
+    assert PE.OUT == "reports/p4e"
+
+
+def test_replay_manifests_record_the_d217_5_window_shift():
+    import inspect
+    iw = R.ICON_WINDOWS
+    assert iw["operational"]["window_shift_min"] == 30 and iw["operational"]["product"] == "gsmap_now_gc"
+    assert "10 observed" in iw["operational"]["a6h"] and "46 observed" in iw["operational"]["a24h"]
+    assert iw["hindsight"]["window_shift_min"] == 0 and "raw is never used" in iw["never"]
+    src = inspect.getsource(R)
+    assert src.count('"icon_windows": ICON_WINDOWS') == 2                # smoke manifest and serving manifest

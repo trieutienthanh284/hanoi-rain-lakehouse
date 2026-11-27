@@ -260,6 +260,9 @@ def test_full_and_final(world, capsys):
                                                                               "matmo")} <= set(srv)
     man = json.loads(st2.get("lake/v1/serving/replay/pkg=2026-11/_manifest.json"))
     assert man["p4f0_verdict"] == "ok" and man["events"]["matmo"]["label_product"] == "imerg_late"
+    iw = man["icon_windows"]                                           # D217-5 window shift recorded (S2, D218-2)
+    assert iw["operational"]["window_shift_min"] == 30 and iw["operational"]["window_end"] == "t0 - 30 min"
+    assert iw["hindsight"]["window_shift_min"] == 0
     assert len(man["events"]["wettest3"]["days_local"]) == 3 and "2025-09-30" not in man["events"]["wettest3"]["days_local"]
     pc = _j("reports/p4fg_final/replay/publish_check.json")
     assert not pc["mismatch"] and len(pc["verified"]) == 9
@@ -291,6 +294,8 @@ def test_smoke(world, capsys):
     rk = st.list(pre + "replay_pkg/")
     assert {pre + "replay_pkg/2025-07-15/replay.parquet", pre + "replay_pkg/2025-07-15/_manifest.json"} <= set(rk)
     assert not st.list("lake/v1/serving/")                                    # smoke never writes the serving prefix
+    sman = json.loads(st.get(pre + "replay_pkg/2025-07-15/_manifest.json"))
+    assert sman["icon_windows"]["operational"]["window_shift_min"] == 30
     capsys.readouterr()
     keys_before = {k: st.get(k) for k in st.list(pre + "files/") if "/drill/" not in k}
     assert C.cli(CT.main, ["--job", "p4fg_smoke", "--store", f"local:{store}", "--run-id", "fx", "--wait-minutes", "0",

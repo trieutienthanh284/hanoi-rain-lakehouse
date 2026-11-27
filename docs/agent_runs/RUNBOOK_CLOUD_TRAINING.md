@@ -231,16 +231,29 @@ Dòng log cần kiểm (bước **Train**):
 - `p4fg_smoke`: `plan` (`gold_id a4a6329bcf13`, `conv_id …`, `prereg_sha fbc7ec89…`); `feat-*`, `nwp-*` `reused true`; `conv-*` (`rows`, `nan_share_max`), `orc-*` (`oracle true`); `g2` (`conv_g2_violations 0`, `set_b_inner_cv_ok true`); `dtcheck` (`verdict`, `pooled_ratio`); `hp-select` (`chosen`); `cmp` (`model2`, `steps`, `union_adopted`, `dt_verdict`); `figs` (`p4e_relabel_ok`); `finalfit-smoke`, `replay-smoke` (`verified 3`); `race_drill_single` `ok true`; dòng `end` `lost 0`, `output_mismatch 0`.
 - Nếu `dtcheck` cho `verdict` khác `ok`: smoke vẫn chạy xong (ghi lại), nhưng agent **dừng ở S2** và báo (P4F.0).
 
-### P4FG.2 Job đầy đủ `p4fg` (CHỈ dispatch sau khi người dùng duyệt smoke; S2)
+### P4FG.1b Smoke lại sau sửa S2 (D218, 2026-11-28)
 
-Run `63baa3224b58` (đổi nếu mã đổi sau smoke). 297 đơn vị: 228 fit (B0 18, lưới 8 × 12, đối lưu trên B0 36, đối lưu trên mô hình tinh chỉnh 36 [alias khi fold chọn g1], oracle B 12, mục tiêu vùng 12, v1 (B) 18), 12 `conv`, 12 `orc`, 6 `base`, `dtcheck`, `fssv1`, 18 `feat` + 12 `nwp` (dùng lại), 7 gate. Gán part bằng LPT theo ước lượng (mọi part cùng n).
+Smoke `db0c4d8a01db` (S2) tìm thấy 2 lỗi mã, đã sửa: vẽ lại hình P4E đọc sai thư mục (`p4e_relabel_ok false`, D218-1) và manifest REPLAY chưa ghi độ dịch cửa sổ 30 phút của D217-5 (D218-2). Mã đổi nên run id đổi, và TASK yêu cầu smoke trước mọi run đầy đủ. Vì vậy chạy lại smoke trước `p4fg`. Smoke mới dùng lại Gold, NWP và `table_v3_conv` (`cid=4e5f3ddb0727` không đổi), không ghi Bronze/Silver.
+
+| # | Form | Khi nào | Ước lượng |
+|---|---|---|---|
+| 0 | lệnh git trong REPORT_P4FG §S2.10 | trước tiên | — |
+| 1 | `p4fg_smoke` / `1/2` / `false` / `true` | sau push | ước (hằng số bảo thủ) 96,6 phút; thực tế lần trước ≈ 21 phút/part |
+| 2 | `p4fg_smoke` / `2/2` / `false` / `true` | ngay sau #1 | ước 51,3 phút |
+| 3 | (agent) `python scripts/p4fg/fetch_gated.py --job p4fg_smoke --run-id 8a88b62a0cd7 --verify` | sau #1–#2 xanh | cục bộ, chỉ đọc, cổng RSS 0,4 GB |
+
+Dòng log cần kiểm thêm: `figs` có `p4e_relabel_ok true`; `replay_pkg/2025-07-03/_manifest.json` có `icon_windows.operational.window_shift_min = 30`.
+
+### P4FG.2 Job đầy đủ `p4fg` (CHỈ dispatch sau khi smoke `8a88b62a0cd7` xanh và agent đã kiểm; S2)
+
+Run `82b2df2b97bb` (trước sửa D218 là `63baa3224b58`; đổi nếu mã đổi tiếp). 297 đơn vị: 228 fit (B0 18, lưới 8 × 12, đối lưu trên B0 36, đối lưu trên mô hình tinh chỉnh 36 [alias khi fold chọn g1], oracle B 12, mục tiêu vùng 12, v1 (B) 18), 12 `conv`, 12 `orc`, 6 `base`, `dtcheck`, `fssv1`, 18 `feat` + 12 `nwp` (dùng lại), 7 gate. Gán part bằng LPT theo ước lượng (mọi part cùng n).
 
 | Phương án | Part | Part chậm nhất (ước) | Runner (ước) |
 |---|---|---|---|
 | đề xuất (0,8 × 250) | 10 | 199,7 phút | ≈ 1 148 phút |
 | tối thiểu (≤ 250) | 7 | 242,8 phút | ≈ 1 120 phút |
 
-Hằng số ước lượng = thời gian thực P4E × 1,5 (Model 1-B 109 s/fit, v1 (B) 23 s/fit) × hệ số lá; P4E thực tế bằng 0,61 × ước. Dispatch 10 form `p4fg` / `i/10` / `false` / `false` liền nhau. Part xong việc thì thoát; mọi part chờ `hp-select` (≤ 150 phút) trước các fit giai đoạn 5. Winner của `compare-done` ghi `SELECTION.json` + `COMPARE_DONE.json`. Sau run: agent `python -m src.models.fetch_run --job p4fg --run-id 63baa3224b58 --verify`.
+Hằng số ước lượng = thời gian thực P4E × 1,5 (Model 1-B 109 s/fit, v1 (B) 23 s/fit) × hệ số lá; P4E thực tế bằng 0,61 × ước. Dispatch 10 form `p4fg` / `i/10` / `false` / `false` liền nhau. Part xong việc thì thoát; mọi part chờ `hp-select` (≤ 150 phút) trước các fit giai đoạn 5. Winner của `compare-done` ghi `SELECTION.json` + `COMPARE_DONE.json`. Sau run: agent `python scripts/p4fg/fetch_gated.py --job p4fg --run-id 82b2df2b97bb --verify`.
 
 ### P4FG.3 Job `p4fg_final` (sau chọn lựa; S3)
 

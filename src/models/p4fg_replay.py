@@ -379,6 +379,26 @@ def write_replay(df: pd.DataFrame, d: Path) -> dict:
     return {n: hashlib.sha256((d / n).read_bytes()).hexdigest() for n in ("replay.parquet", "replay.json.gz")}
 
 
+# D217-5 (accepted by the user, CLAUDE.md §8 P4F/P4G addendum 2026-11-27): the operational GC windows end 30 min
+# before t0; the REPLAY manifest records this shift (S2 fix D218-2)
+ICON_WINDOWS = {
+    "operational": {"product": "gsmap_now_gc", "a6h": "10 observed GC half-hour slots ending at t0 - 30 min "
+                    "+ latest admissible GC rate x 1 h (persistence extension, serving_mode_P5)",
+                    "a24h": "46 observed GC half-hour slots ending at t0 - 30 min + latest admissible GC rate x 1 h",
+                    "window_end": "t0 - 30 min", "window_shift_min": 30,
+                    "why": "GSMaP NOW windows become available 65 min after their start (ADD-005): at t0 the newest "
+                           "fully available half-hour slot ends at t0 - 30 min",
+                    "slot_rule": "slot [s, s+30) = 0.25 x (r(window s-30) + r(window s)) mm (code dt 0.5 h per "
+                                 "30-min file, P4F.0)",
+                    "thresholds": "configs/flood_indicator.yaml product_thresholds.gsmap_now_gc",
+                    "decision": "D217-5, accepted by the user 2026-11-27 (CLAUDE.md §8 P4F/P4G addendum)"},
+    "hindsight": {"product": "imerg_final (imerg_late for Matmo)", "a6h": "12 half-hour slots ending at t0",
+                  "a24h": "48 half-hour slots ending at t0", "window_end": "t0", "window_shift_min": 0,
+                  "thresholds": "configs/flood_indicator.yaml product_thresholds of the IMERG product"},
+    "never": "GSMaP NOW raw is never used for icons",
+}
+
+
 def column_dictionary(df: pd.DataFrame, plan: dict) -> dict:
     out = {}
     for c in df.columns:
@@ -453,7 +473,7 @@ def gate_replay_smoke(ctx) -> tuple[list[str], dict]:
     d = out_dir("replay_smoke", day)
     sha = write_replay(df, d)
     man = {"package": "smoke (run prefix only)", "events": {day: {"rows": int(len(df)), "sha256": sha}},
-           "columns": column_dictionary(df, plan), "flood_indicator_sha256": fi_hash(),
+           "columns": column_dictionary(df, plan), "icon_windows": ICON_WINDOWS, "flood_indicator_sha256": fi_hash(),
            "p4f0_verdict": ctx.read_json(f"{FG_.OUT}/dtcheck/dt_check.json")["verdict"], "note": NOT_FLOOD}
     write_json(d / "_manifest.json", man)
     files = {f"{day}/{n}": d / n for n in ("replay.parquet", "replay.json.gz", "_manifest.json")}
@@ -645,6 +665,7 @@ def run_final_unit(unit, ctx) -> tuple[list[str], dict]:
                "icons": "operational = GSMaP NOW GC (product available at t0, product_thresholds.gsmap_now_gc, "
                         "1-hour persistence extension); hindsight = IMERG Final (Late for Matmo); GSMaP NOW raw is "
                         "never used for icons",
+               "icon_windows": ICON_WINDOWS,
                "notes": ["v1 stays the official model; Model 2 / Model 1-B are candidates (demo only)",
                          "Yagi v1 predictions are P4B OOF, not fully independent (MODEL_CARD v1 §6.8)",
                          "ring rows: v1 columns NaN (P4B predicted city pixels only)", NOT_FLOOD]}
