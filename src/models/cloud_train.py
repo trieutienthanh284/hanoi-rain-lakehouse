@@ -498,13 +498,118 @@ def commit_unit_single(store, job: str, run_id: str, unit: Unit, rels: list[str]
     return {"state": "won", "mismatch": []}
 
 
+def drill_payload_key(job: str, run_id: str, attempt: str, drill_unit: str) -> str:
+    """Scratch record of one drill contender's payload (sha256 per final key), written before the race (D219)."""
+    return run_prefix(job, run_id) + f"scratch/{attempt}/drill_payload/{drill_unit}.json"
+
+
+def drill_register(store, job: str, run_id: str, drill_unit: str, me: str, payload: dict) -> None:
+    body = json.dumps({"unit": drill_unit, "attempt": me,
+                       "sha256": {file_key(job, run_id, r): C.sha256_bytes(b) for r, b in sorted(payload.items())}},
+                      indent=1, sort_keys=True).encode()
+    store.put(drill_payload_key(job, run_id, me, drill_unit), body)
+
+
+def last_modified(store, prefix: str) -> dict[str, float] | None:
+    """{key: LastModified (epoch s)} under prefix: R2 list_objects_v2, local store file mtime; None if unknown."""
+    s3 = getattr(store, "s3", None)
+    if s3 is not None:
+        out, token = {}, None
+        while True:
+            kw = {"Bucket": store.bucket, "Prefix": prefix}
+            if token:
+                kw["ContinuationToken"] = token
+            store.ops["class_a"] += 1
+            r = s3.list_objects_v2(**kw)
+            for o in r.get("Contents", []):
+                out[o["Key"]] = o["LastModified"].timestamp()
+            if not r.get("IsTruncated"):
+                return out
+            token = r["NextContinuationToken"]
+    root_ = getattr(store, "root", None)
+    if root_ is not None:
+        return {k: (Path(root_) / k).stat().st_mtime for k in store.list(prefix)}
+    return None
+
+
+def drill_check(store, job: str, run_id: str, drill_unit: str, finals: list[str], ids: dict, res: dict) -> dict:
+    """D219 pass condition (user decision 2026-11-28), evaluated over ALL parts on the store:
+    (1) exactly one claim for the drill unit, and it is g001; (2) every final key's bytes == the marker's sha256 ==
+    the claimant's registered payload; (3) every other registered contender's bytes only under scratch/ (own
+    contenders must have finished with their bytes there; another part's contender still waiting is 'pending');
+    (4) no final key has a LastModified after the marker; (5) own contenders: only 'won' / 'yielded', exit code 0,
+    a 'won' contender is the claimant. Both own contenders yielding is a pass only when another part's contender is
+    the single claimant (committed_by_other_part)."""
+    pre = run_prefix(job, run_id)
+    fpre = pre + "files/"
+    fkeys = [file_key(job, run_id, r) for r in finals]
+    claims = sorted(k for k in store.list(pre + f"claims/{drill_unit}/") if k.endswith(".json"))
+    one_claim = claims == [claim_key(job, run_id, drill_unit, 1)]
+    claimant = json.loads(store.get(claims[0])).get("attempt") if one_claim else None
+    mkk = marker_key(job, run_id, drill_unit)
+    mk = json.loads(store.get(mkk)) if marker_exists(store, job, run_id, drill_unit) else {}
+    have = store.list(file_key(job, run_id, f"reports/{job}/drill/{drill_unit}/"))
+    fin = {k: C.sha256_bytes(store.get(k)) if k in have else None for k in fkeys}
+    extra_final = sorted(set(have) - set(fkeys))                 # a final key nobody's payload names
+    reg = {}
+    for k in store.list(pre + "scratch/"):
+        if k.endswith(f"/drill_payload/{drill_unit}.json"):
+            o = json.loads(store.get(k))
+            reg[o["attempt"]] = o["sha256"]
+    final_eq_marker = bool(mk) and set(mk.get("outputs", {})) == set(fkeys) and not extra_final and all(
+        fin[k] is not None and mk["outputs"][k] == fin[k] for k in fkeys)
+    final_eq_claimant = claimant in reg and set(reg[claimant]) == set(fkeys) and all(
+        reg[claimant][k] == fin[k] for k in fkeys)
+    mine = set(ids.values())
+    others_ok, pending, checked = True, [], []
+    for a, sh in sorted(reg.items()):
+        if a == claimant:
+            continue
+        if any(fin.get(k) == v and v != reg.get(claimant, {}).get(k) for k, v in sh.items()):
+            others_ok = False                                    # a non-claimant's own bytes sit in a final key
+        sc = pre + f"scratch/{a}/files/"
+        got = store.list(sc)
+        skeys = {k: sc + k[len(fpre):] for k in sh}
+        if all(s in got for s in skeys.values()):
+            if not all(C.sha256_bytes(store.get(skeys[k])) == v for k, v in sh.items()):
+                others_ok = False
+            checked.append(a)
+        elif a in mine:
+            others_ok = False                                    # own contender finished without its scratch copy
+        else:
+            pending.append(a)
+    if any(a not in reg for a in mine):
+        others_ok = False
+    lm_f = last_modified(store, file_key(job, run_id, f"reports/{job}/drill/{drill_unit}/"))
+    lm_m = last_modified(store, mkk)
+    no_late = (lm_f is not None and lm_m is not None and mkk in lm_m
+               and all(k in lm_f and lm_f[k] <= lm_m[mkk] for k in list(fkeys) + extra_final))
+    states = {n: r["state"] for n, r in res.items()}
+    won = [n for n, s in states.items() if s == "won"]
+    exit_codes = {n: _exit_code({"mismatch": r["mismatch"]}) for n, r in res.items()}
+    by_other = one_claim and claimant is not None and claimant not in mine
+    own_ok = (all(s in ("won", "yielded") for s in states.values()) and all(v == 0 for v in exit_codes.values())
+              and ((len(won) == 1 and ids[won[0]] == claimant) or (not won and by_other)))
+    ok = bool(one_claim and final_eq_marker and final_eq_claimant and others_ok and no_late and own_ok)
+    w = won[0] if len(won) == 1 else None
+    losers = [n for n in states if n != w]
+    return {"ok": ok, "drill_unit": drill_unit, "states": states, "winner": w, "claimant": claimant,
+            "committed_by_other_part": bool(by_other and not won), "claims": [k[len(pre):] for k in claims],
+            "final_equals_marker": final_eq_marker, "final_equals_claimant": final_eq_claimant,
+            "final_equals_winner": bool(w is not None and final_eq_claimant),
+            "loser_bytes_in_scratch_only": others_ok, "other_contenders_checked": len(checked),
+            "other_contenders_pending": len(pending), "no_final_after_marker": no_late,
+            "loser_exit_code": max((exit_codes[n] for n in losers), default=None), "files": len(fkeys)}
+
+
 def race_drill_single(store, job: str, run_id: str, unit: Unit, run_unit, mirror: Path, poll_seconds: float = 2.0,
                       stale_minutes: float = 2.0) -> dict:
-    """Extended race drill (P4E.0-1): the outputs of gate `unit` are committed under a fresh drill unit id by two
-    contenders started at the same instant (threads, barrier) with DIFFERENT bytes. Pass = exactly one writer (one
-    'won', one 'yielded'), every final key byte-identical to the winner's payload and to its marker sha, the loser's
-    bytes only under its scratch prefix, and the loser's exit code 0. Two parts running this drill at the same time
-    race on the same drill unit id as well (the first free drill-<gate>-r<k>)."""
+    """Extended race drill (P4E.0-1, pass condition D219): the outputs of gate `unit` are committed under a drill
+    unit id (the first drill-<gate>-r<k> without a marker) by two contenders started at the same instant (threads,
+    barrier) with DIFFERENT bytes; each contender records its payload sha256 under its scratch prefix first. Two
+    parts running the drill at the same time may race on the same drill unit id; the pass condition (drill_check)
+    is therefore evaluated over all parts: one claim g001, final bytes == marker == claimant's payload, every other
+    contender's bytes only under scratch/, no final key written after the marker."""
     import threading
     rels, metrics = run_unit(unit)
     k = 1
@@ -515,6 +620,8 @@ def race_drill_single(store, job: str, run_id: str, unit: Unit, run_unit, mirror
             if (ROOT / r).is_file()}
     pay = {"A": base, "B": {r: b + b"\n" for r, b in base.items()}}       # B differs in every file
     ids = {n: attempt_id(f"drill{n}") for n in pay}
+    for n in pay:
+        drill_register(store, job, run_id, du.id, ids[n], pay[n])
     res, bar = {}, threading.Barrier(2)
 
     def go(n):
@@ -529,25 +636,7 @@ def race_drill_single(store, job: str, run_id: str, unit: Unit, run_unit, mirror
         t.start()
     for t in th:
         t.join()
-    states = {n: r["state"] for n, r in res.items()}
-    winners = [n for n, s in states.items() if s == "won"]
-    mk = json.loads(store.get(marker_key(job, run_id, du.id))) if marker_exists(store, job, run_id, du.id) else {}
-    have = store.list(file_key(job, run_id, f"reports/{job}/drill/{du.id}/"))
-    final = {r: store.get(file_key(job, run_id, r)) if file_key(job, run_id, r) in have else b"" for r in base}
-    w = winners[0] if len(winners) == 1 else None
-    same_as_winner = w is not None and all(final[r] == pay[w][r] for r in base)
-    same_as_marker = bool(mk) and all(mk["outputs"].get(file_key(job, run_id, r)) == C.sha256_bytes(final[r])
-                                      for r in base)
-    loser = [n for n in pay if n != w]
-    scratch = run_prefix(job, run_id) + "scratch/"
-    loser_scratch = bool(loser) and all(
-        f"{scratch}{ids[loser[0]]}/files/{r}" in store.list(f"{scratch}{ids[loser[0]]}/") for r in base)
-    loser_exit = _exit_code({"mismatch": res[loser[0]]["mismatch"]}) if loser else None
-    ok = (len(winners) == 1 and sorted(states.values()) == ["won", "yielded"] and same_as_winner and same_as_marker
-          and loser_scratch and loser_exit == 0)
-    out = {"ok": ok, "drill_unit": du.id, "states": states, "winner": w, "final_equals_winner": same_as_winner,
-           "final_equals_marker": same_as_marker, "loser_bytes_in_scratch_only": loser_scratch,
-           "loser_exit_code": loser_exit, "files": len(base)}
+    out = drill_check(store, job, run_id, du.id, list(base), ids, res)
     C.log("race_drill_single", **out)
     return out
 

@@ -286,7 +286,10 @@ def v1_preds(ctx, kind: str, L: int, thr: float) -> pd.DataFrame:
 def build_replay(ctx, event: str, days_local: list[str], plan: dict) -> pd.DataFrame:
     """One row per (half-hour t0, pixel): city 47 + ring within Chebyshev 2 (is_city flag). plan: {"label_source",
     "v1_kind", "oos": {model: (bool, why)}, "models": {name: callable(L, thr) -> DataFrame(pixel_id, t0, p_raw|p,
-    alarm)}, "display_union": bool}."""
+    alarm)}, "display_union": bool, "prob_scale": {name: scale}}. Probability columns (D220, user decision
+    2026-11-28): p_<name>_* is on the scale each model was evaluated on (p_cal when the predictions carry it: fold
+    Platt for LOSO OOF rows, final-fit Platt for final-fit rows; v1: its serving probability, raw), and
+    p_raw_<name>_* holds the uncalibrated LightGBM probability of the models that carry p_cal."""
     from src.gold import features as F
     from src.models import data as D
     cfg = ctx.cfg
@@ -332,9 +335,13 @@ def build_replay(ctx, event: str, days_local: list[str], plan: dict) -> pd.DataF
                 pr = fn(L, thr)
                 if pr is None:
                     continue
-                pcol = "p_raw" if "p_raw" in pr.columns else "p"
-                j = key.merge(pr[["pixel_id", "t0", pcol, "alarm"]], on=["pixel_id", "t0"], how="left")
-                out[f"p_{name}_{kstr(thr)}_F{L}"] = j[pcol].to_numpy("float32")
+                if "p_cal" in pr.columns:
+                    j = key.merge(pr[["pixel_id", "t0", "p_cal", "p_raw", "alarm"]], on=["pixel_id", "t0"], how="left")
+                    out[f"p_{name}_{kstr(thr)}_F{L}"] = j["p_cal"].to_numpy("float32")
+                    out[f"p_raw_{name}_{kstr(thr)}_F{L}"] = j["p_raw"].to_numpy("float32")
+                else:
+                    j = key.merge(pr[["pixel_id", "t0", "p", "alarm"]], on=["pixel_id", "t0"], how="left")
+                    out[f"p_{name}_{kstr(thr)}_F{L}"] = j["p"].to_numpy("float32")
                 al[thr] = j["alarm"].fillna(False).to_numpy(bool)
             if primary(cfg) in al and heavy(cfg) in al:
                 out[f"rain_class_{name}_F{L}"] = rain_class(al.get(0.5), al[primary(cfg)], al[heavy(cfg)])
@@ -399,6 +406,23 @@ ICON_WINDOWS = {
 }
 
 
+# D220 (user decision 2026-11-28, option i): every REPLAY probability column is on the scale its model was
+# evaluated on; the manifest records the scale per column
+PROB_SCALES = {
+    "platt_fold": "platt_fold: Platt fitted on the inner OOF of the LOSO fold that predicted the row (P4E path, "
+                  "pre_registered.base_model.probabilities platt_crossfit_as_p4e); evaluated scale of the LOSO numbers",
+    "platt_final": "platt_final: final-fit Platt of models/v2_candidate/<model>/lead<L>_thr<t>/meta.json (inner CV "
+                   "on the final-fit rows)",
+    "v1_serving_raw": "v1_serving_raw: v1 serving probability (models/v1 MODEL_CARD: calibration raw in 18/18 models)",
+    "raw": "raw: uncalibrated LightGBM probability (reference only; alarms and rain_class use the Platt scale)",
+}
+
+
+def prob_scale_map(columns: dict) -> dict:
+    """{column: short scale name} for the manifest (from a column dictionary)."""
+    return {c: e["prob_scale"].split(":", 1)[0] for c, e in columns.items() if "prob_scale" in e}
+
+
 def column_dictionary(df: pd.DataFrame, plan: dict) -> dict:
     out = {}
     for c in df.columns:
@@ -406,6 +430,10 @@ def column_dictionary(df: pd.DataFrame, plan: dict) -> dict:
         for name, (o, why) in plan["oos"].items():
             if f"_{name}_" in c or c == f"oos_{name}":
                 e |= {"model": name, "oos": bool(o), "why": why}
+        if c.startswith("p_raw_"):
+            e["prob_scale"] = PROB_SCALES["raw"]
+        elif c.startswith("p_") and e.get("model") in plan.get("prob_scale", {}):
+            e["prob_scale"] = PROB_SCALES[plan["prob_scale"][e["model"]]]
         if c.startswith(("a6h", "a24h", "icon")):
             e["product"] = "imerg (hindsight)" if "hindsight" in c else "gsmap_now_gc (operational, available at t0)"
         if c.startswith("label"):
@@ -466,14 +494,17 @@ def gate_replay_smoke(ctx) -> tuple[list[str], dict]:
     plan = {"label_source": "imerg_final", "display_union": bool(sel["union_adopted_for_model2"]),
             "oos": {"v1": (True, "P4B test 2025 (v1 trained on 2023-2024)"),
                     "m2": (True, "LOSO fold 2025 OOF"), "m1b": (True, "LOSO fold 2025 OOF")},
+            "prob_scale": {"v1": "v1_serving_raw", "m2": "platt_fold", "m1b": "platt_fold"},
             "models": {"v1": lambda L, t: v1_preds(ctx, "test", L, t),
                        "m2": lambda L, t: model_preds(ctx, specs_m2, fold, L, t, True),
                        "m1b": lambda L, t: model_preds(ctx, specs_b0, fold, L, t, True)}}
     df = build_replay(ctx, f"smoke_{day}", [day], plan)
     d = out_dir("replay_smoke", day)
     sha = write_replay(df, d)
+    cols = column_dictionary(df, plan)
     man = {"package": "smoke (run prefix only)", "events": {day: {"rows": int(len(df)), "sha256": sha}},
-           "columns": column_dictionary(df, plan), "icon_windows": ICON_WINDOWS, "flood_indicator_sha256": fi_hash(),
+           "columns": cols, "prob_scale": prob_scale_map(cols), "prob_scales": PROB_SCALES,
+           "icon_windows": ICON_WINDOWS, "flood_indicator_sha256": fi_hash(),
            "p4f0_verdict": ctx.read_json(f"{FG_.OUT}/dtcheck/dt_check.json")["verdict"], "note": NOT_FLOOD}
     write_json(d / "_manifest.json", man)
     files = {f"{day}/{n}": d / n for n in ("replay.parquet", "replay.json.gz", "_manifest.json")}
@@ -531,7 +562,8 @@ def loso_info(cs, spec: str, s: int, L: int, thr: float) -> dict:
 
 def final_preds(ctx, model: str, L: int, thr: float, months: list) -> pd.DataFrame:
     """Predictions of a packaged final model (models/v2_candidate/<model>/lead<L>_thr<t>/) on the Gold rows of
-    `months` (city + ring): p_raw, alarm (Platt + cut of meta.json; 7.6 nested with the 2.5 alarm of the model)."""
+    `months` (city + ring): p_raw, p_cal = final-fit Platt of meta.json (D220, user decision 2026-11-28), alarm
+    (p_cal >= cut of meta.json; 7.6 nested with the 2.5 alarm of the model)."""
     import lightgbm as lgb
 
     def one(t):
@@ -545,7 +577,7 @@ def final_preds(ctx, model: str, L: int, thr: float, months: list) -> pd.DataFra
         p = bst.predict(X)
         pc = PB.apply_calibrator(meta_["platt"], p)
         return pd.DataFrame({"pixel_id": m["pixel_id"].to_numpy("int64"), "t0": m["t0"].to_numpy(),
-                             "p_raw": p, "alarm": pc >= meta_["cut"]["cut"]})
+                             "p_raw": p, "p_cal": pc, "alarm": pc >= meta_["cut"]["cut"]})
     o = one(thr)
     if thr == heavy(ctx.cfg):
         o2 = one(primary(ctx.cfg))
@@ -573,6 +605,7 @@ def event_plan(ctx, sel: dict, event: str) -> tuple[list[str], dict]:
         oos = {"v1": (True, "P4B secondary check 2025-10 (v1 trained on 2023-2024)"),
                "m2": (True, "final fit; 2025-10 excluded from training (decision 6)"),
                "m1b": (True, "final fit; 2025-10 excluded from training (decision 6)")}
+        scale = {"v1": "v1_serving_raw", "m2": "platt_final", "m1b": "platt_final"}
         models = {"v1": lambda L, t: v1_preds(ctx, vk, L, t),
                   "m2": lambda L, t: final_preds(ctx, "model1b" if same else "model2", L, t, [(2025, 10)])}
         if not same:
@@ -592,12 +625,14 @@ def event_plan(ctx, sel: dict, event: str) -> tuple[list[str], dict]:
             v1why = "P4B test 2025"
         lab = "imerg_final"
         oos = {"v1": (True, v1why), "m2": (True, f"LOSO fold {fold} OOF"), "m1b": (True, f"LOSO fold {fold} OOF")}
+        scale = {"v1": "v1_serving_raw", "m2": "platt_fold", "m1b": "platt_fold"}
         models = {"v1": lambda L, t: v1_preds(ctx, vk, L, t), "m2": loso(m2_orig, fold, not same)}
         if not same:
             models["m1b"] = loso(b0, fold, False)
     if same:
         oos.pop("m1b")
-    return days, {"label_source": lab, "display_union": union, "oos": oos, "models": models}
+        scale.pop("m1b")
+    return days, {"label_source": lab, "display_union": union, "oos": oos, "models": models, "prob_scale": scale}
 
 
 def run_final_unit(unit, ctx) -> tuple[list[str], dict]:
@@ -642,6 +677,7 @@ def run_final_unit(unit, ctx) -> tuple[list[str], dict]:
                "label_product": plan["label_source"],
                "oos": {k: {"oos": v[0], "why": v[1]} for k, v in plan["oos"].items()},
                "columns": column_dictionary(df, plan), "display_rule": str(df["display_rule"].iloc[0])}
+        rec["prob_scale"] = prob_scale_map(rec["columns"])
         write_json(d / "event.json", rec)
         return [rel(d / n) for n in ("replay.parquet", "replay.json.gz", "event.json")], {
             "rows": int(len(df)), "seconds": round(time.time() - t1, 1)}
@@ -655,7 +691,8 @@ def run_final_unit(unit, ctx) -> tuple[list[str], dict]:
                 if not (root() / OUT_FINAL / "replay" / e / n).is_file():
                     ctx.fetch_run_files(f"{OUT_FINAL}/replay/{e}/{n}")
                 files[f"{e}/{n}"] = root() / OUT_FINAL / "replay" / e / n
-            evs[e] = {k: rec[k] for k in ("days_local", "rows", "sha256", "label_product", "oos", "display_rule")}
+            evs[e] = {k: rec[k] for k in ("days_local", "rows", "sha256", "label_product", "oos", "display_rule",
+                                          "prob_scale")}
         cols = ctx.read_json(f"{OUT_FINAL}/replay/{EVENTS[0]}/event.json")["columns"]
         man = {"package": "pkg=2026-11", "events": evs, "column_dictionary": cols,
                "wettest_definition": ctx.cfg["pre_registered"]["replay"]["wettest_test_days"],
@@ -665,7 +702,7 @@ def run_final_unit(unit, ctx) -> tuple[list[str], dict]:
                "icons": "operational = GSMaP NOW GC (product available at t0, product_thresholds.gsmap_now_gc, "
                         "1-hour persistence extension); hindsight = IMERG Final (Late for Matmo); GSMaP NOW raw is "
                         "never used for icons",
-               "icon_windows": ICON_WINDOWS,
+               "icon_windows": ICON_WINDOWS, "prob_scales": PROB_SCALES,
                "notes": ["v1 stays the official model; Model 2 / Model 1-B are candidates (demo only)",
                          "Yagi v1 predictions are P4B OOF, not fully independent (MODEL_CARD v1 §6.8)",
                          "ring rows: v1 columns NaN (P4B predicted city pixels only)", NOT_FLOOD]}

@@ -4,6 +4,7 @@ import json
 import re
 from pathlib import Path
 
+import pandas as pd
 import pytest
 import yaml
 
@@ -203,3 +204,22 @@ def test_replay_manifests_record_the_d217_5_window_shift():
     assert iw["hindsight"]["window_shift_min"] == 0 and "raw is never used" in iw["never"]
     src = inspect.getsource(R)
     assert src.count('"icon_windows": ICON_WINDOWS') == 2                # smoke manifest and serving manifest
+
+
+def test_replay_probability_columns_on_the_evaluated_scale():
+    """D220 (user decision 2026-11-28, option i): p_<model>_* = p_cal for m1b / m2 (fold Platt for LOSO rows,
+    final-fit Platt for final-fit rows), p_raw_<model>_* added, v1 = serving probability (raw); scale per column."""
+    plan = {"oos": {"v1": (True, "x"), "m2": (True, "x"), "m1b": (True, "x")},
+            "prob_scale": {"v1": "v1_serving_raw", "m2": "platt_final", "m1b": "platt_fold"}, "label_source": "l"}
+    df = pd.DataFrame({"p_v1_2p5_F0": [0.1], "p_m2_2p5_F30": [0.2], "p_raw_m2_2p5_F30": [0.3],
+                       "p_m1b_7p6_F60": [0.1], "p_raw_m1b_7p6_F60": [0.2], "rain_class_m2_F30": ["dry"]})
+    cols = R.column_dictionary(df, plan)
+    assert R.prob_scale_map(cols) == {"p_v1_2p5_F0": "v1_serving_raw", "p_m2_2p5_F30": "platt_final",
+                                      "p_raw_m2_2p5_F30": "raw", "p_m1b_7p6_F60": "platt_fold",
+                                      "p_raw_m1b_7p6_F60": "raw"}
+    assert "prob_scale" not in cols["rain_class_m2_F30"]
+    import inspect
+    src = inspect.getsource(R)
+    assert '"p_cal": pc, "alarm": pc >= meta_["cut"]["cut"]' in src           # final_preds carries the Platt scale
+    assert src.count('"prob_scale": {"v1": "v1_serving_raw", "m2": "platt_fold", "m1b": "platt_fold"}') == 1
+    assert 'scale = {"v1": "v1_serving_raw", "m2": "platt_final", "m1b": "platt_final"}' in src

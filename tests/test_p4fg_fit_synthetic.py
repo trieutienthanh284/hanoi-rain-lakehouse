@@ -20,6 +20,7 @@ from src.models import p4d as PD
 from src.models import p4e as PE
 from src.models import p4fg as FG
 from src.models import p4fg_gates as G
+from src.models import p4fg_replay as R
 from src.realtime import common as C
 
 Gr = F.Grid()
@@ -275,6 +276,21 @@ def test_full_and_final(world, capsys):
     assert (~rp["is_city"]).any() and rp.loc[~rp["is_city"], "p_v1_2p5_F0"].isna().all()
     assert rp.loc[~rp["is_city"], "p_m2_2p5_F0"].notna().any()
     assert set(rp["icon_product"]) == {"gsmap_now_gc"} and set(rp["icon_product_hindsight"]) == {"imerg_final"}
+    # D220: probability columns on the evaluated scale; p_raw_* for m1b/m2 only; scale per column in the manifest
+    ps = man["events"]["yagi"]["prob_scale"]
+    assert ps["p_v1_2p5_F0"] == "v1_serving_raw" and ps["p_m2_2p5_F0"] == "platt_fold"
+    assert ps["p_raw_m2_2p5_F0"] == "raw" and "p_raw_v1_2p5_F0" not in rp.columns
+    assert man["events"]["matmo"]["prob_scale"]["p_m2_2p5_F0"] == "platt_final"
+    assert set(man["prob_scales"]) == {"platt_fold", "platt_final", "v1_serving_raw", "raw"}
+    src_sel = _j("reports/p4fg_final/selection_source.json")
+    same = src_sel["resolved"]["model2"] == src_sel["resolved"]["model1b"]
+    mm = json.loads(st2.get("lake/v1/runs/p4fg_final/fx/files/models/v2_candidate/"
+                            f"{R.MODEL_DIRS['model1b' if same else 'model2']}/lead0_thr2p5/meta.json"))
+    rm = pd.read_parquet(io.BytesIO(st2.get("lake/v1/serving/replay/pkg=2026-11/matmo/replay.parquet")))
+    ok = rm["p_raw_m2_2p5_F0"].notna()
+    assert ok.any() and np.allclose(rm.loc[ok, "p_m2_2p5_F0"], PB.apply_calibrator(
+        mm["platt"], rm.loc[ok, "p_raw_m2_2p5_F0"].to_numpy("float64")), atol=1e-5)
+    assert not np.allclose(rm.loc[ok, "p_m2_2p5_F0"], rm.loc[ok, "p_raw_m2_2p5_F0"], atol=1e-4)
     # the store refuses a second package with other bytes (put-if-absent): re-running publish is a no-op
     assert C.cli(CT.main, ["--job", "p4fg_final", "--store", f"local:{store}", "--run-id", "fx", "--part", "1/1"]) == 0
 
@@ -296,6 +312,12 @@ def test_smoke(world, capsys):
     assert not st.list("lake/v1/serving/")                                    # smoke never writes the serving prefix
     sman = json.loads(st.get(pre + "replay_pkg/2025-07-15/_manifest.json"))
     assert sman["icon_windows"]["operational"]["window_shift_min"] == 30
+    assert sman["prob_scale"]["p_m1b_2p5_F30"] == "platt_fold" and sman["prob_scale"]["p_v1_2p5_F30"] == "v1_serving_raw"
+    srp = pd.read_parquet(io.BytesIO(st.get(pre + "replay_pkg/2025-07-15/replay.parquet")))
+    info = json.loads(st.get(pre + f"files/reports/p4fg/fit/{FG.fit_id(FG.B0, 2025, 30, 2.5)}.json"))
+    ok = srp["p_raw_m1b_2p5_F30"].notna()
+    assert ok.any() and np.allclose(srp.loc[ok, "p_m1b_2p5_F30"], PB.apply_calibrator(
+        info["platt"], srp.loc[ok, "p_raw_m1b_2p5_F30"].to_numpy("float64")), atol=1e-5)   # fold Platt (D220)
     capsys.readouterr()
     keys_before = {k: st.get(k) for k in st.list(pre + "files/") if "/drill/" not in k}
     assert C.cli(CT.main, ["--job", "p4fg_smoke", "--store", f"local:{store}", "--run-id", "fx", "--wait-minutes", "0",
